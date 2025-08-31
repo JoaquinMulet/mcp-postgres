@@ -1,3 +1,5 @@
+# postgres_server.py
+
 from typing import Any, Optional, List, Dict
 import psycopg
 from psycopg.rows import dict_row
@@ -9,7 +11,8 @@ import argparse
 import time
 import json
 import base64
-from pydantic import BaseModel, Field
+import re # <--- AÑADIR ESTA LÍNEA
+from pydantic import BaseModel, Field, field_validator # <--- MODIFICAR ESTA LÍNEA
 from typing import Literal
 
 # Configure logging
@@ -171,10 +174,62 @@ class QueryInput(BaseModel):
     format: Literal["markdown", "json"] = Field(default="markdown", description="Output format for results")
 
 
+# --- SECCIÓN MODIFICADA ---
 class QueryJSONInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = 500
+
+    @field_validator('sql', mode='before')
+    def strip_semicolon(cls, value: str) -> str:
+        """Elimina el punto y coma final y espacios en blanco."""
+        if isinstance(value, str):
+            return value.strip().removesuffix(';')
+        return value
+
+    @field_validator('sql')
+    def validate_allowed_operations(cls, value: str) -> str:
+        """
+        Validador de seguridad principal.
+        Solo permite las operaciones explícitamente seguras definidas en el SYSTEM_PROMPT.
+        """
+        sql_lower = value.lower().strip()
+        
+        # Permitimos SELECT y WITH sin restricciones
+        if sql_lower.startswith('select') or sql_lower.startswith('with'):
+            return value
+
+        # Permitimos INSERT INTO
+        if sql_lower.startswith('insert into'):
+            return value
+
+        # Permitimos UPDATE, PERO SOLO para cambiar el status a 'VOID' o 'SUPERSEDED'
+        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
+        if update_pattern.match(value):
+            return value
+        
+        # Si la consulta es un UPDATE pero no sigue el patrón seguro, la bloqueamos.
+        if sql_lower.startswith('update'):
+            raise ValueError("Operación UPDATE no permitida. Solo se permite actualizar el 'status' de las transacciones a 'VOID' o 'SUPERSEDED'.")
+
+        # Bloqueamos explícitamente todas las demás operaciones peligrosas.
+        dangerous_keywords = ['delete', 'drop', 'create', 'alter', 'truncate']
+        if any(sql_lower.startswith(keyword) for keyword in dangerous_keywords):
+            raise ValueError(f"Operación '{sql_lower.split()[0]}' no permitida.")
+
+        # Si no coincide con nada de lo anterior, es una consulta desconocida y la bloqueamos por seguridad.
+        raise ValueError("Tipo de consulta SQL no reconocida o no permitida.")
+
+    @field_validator('sql')
+    def validate_table_names_are_lowercase(cls, value: str) -> str:
+        """Valida que los nombres de las tablas en FROM/JOIN estén en minúsculas."""
+        table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', value, re.IGNORECASE)
+        for name in table_names:
+            # Ignoramos tablas del sistema de PostgreSQL
+            if not name.islower() and not name.lower().startswith('pg_'):
+                raise ValueError(f"Nombre de tabla inválido: '{name}'. Todos los nombres de tablas deben estar en minúsculas.")
+        return value
+# --- FIN DE LA SECCIÓN MODIFICADA ---
 
 
 def _is_select_like(sql: str) -> bool:
@@ -191,6 +246,8 @@ def _exec_query(
     conn = None
     try:
         conn = get_connection()
+        # La validación de READONLY ahora es manejada por el validador de Pydantic.
+        # Esta comprobación se mantiene como una segunda capa de seguridad.
         if READONLY and not _is_select_like(sql):
             return [] if as_json else "Read-only mode is enabled; only SELECT/CTE queries are allowed."
 
@@ -235,7 +292,10 @@ def _exec_query(
                 result_lines.append(f"\nNote: Results truncated at {row_limit} rows. Increase row_limit to fetch more.")
             return "\n".join(result_lines)
     except Exception as e:
-        return [] if as_json else f"Query error: {str(e)}\nQuery: {sql}"
+        # Devolvemos el error específico de la base de datos, que es más útil para el feedback loop.
+        error_message = f"Error de base de datos: {str(e)}"
+        logger.error(error_message)
+        return [] if as_json else error_message
     finally:
         if conn:
             conn.close()

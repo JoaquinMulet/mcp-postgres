@@ -20,11 +20,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger('postgres-mcp-server')
 mcp = FastMCP("PostgreSQL Explorer", log_level="INFO")
 
+# --- DEFINICIÓN DE ARGUMENTOS (SECCIÓN CORREGIDA) ---
 parser = argparse.ArgumentParser(description="PostgreSQL Explorer MCP server")
 parser.add_argument("--conn", dest="conn", default=os.getenv("POSTGRES_CONNECTION_STRING"), help="PostgreSQL connection string or DSN")
-# ... (otros argumentos de argparse)
+parser.add_argument("--transport", dest="transport", choices=["stdio", "sse", "streamable-http"], default=os.getenv("MCP_TRANSPORT", "stdio"), help="Transport protocol")
+parser.add_argument("--host", dest="host", default=os.getenv("MCP_HOST", "127.0.0.1"), help="Host to bind for SSE/HTTP transports")
+parser.add_argument("--port", dest="port", type=int, default=os.getenv("MCP_PORT", 8000), help="Port to bind for SSE/HTTP transports")
+parser.add_argument("--mount", dest="mount", default=os.getenv("MCP_SSE_MOUNT"), help="Optional mount path for SSE transport")
 args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
+
+# ... (El resto del código hasta el bloque de ejecución se mantiene igual) ...
 
 # --- LÓGICA DE CONEXIÓN ---
 def get_connection():
@@ -39,13 +45,13 @@ def get_connection():
         logger.error(f"Failed to establish database connection: {str(e)}")
         raise
 
-# --- MODELOS PYDANTIC (SIMPLIFICADOS) ---
+# --- MODELOS PYDANTIC ---
 class QueryJSONInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = 500
 
-# --- FUNCIÓN DE VALIDACIÓN CENTRALIZADA ---
+# --- FUNCIÓN DE VALIDACIÓN ---
 def validate_and_sanitize_sql(sql: str) -> str:
     sanitized_sql = sql.strip().removesuffix(';')
     sql_lower = sanitized_sql.lower()
@@ -69,7 +75,7 @@ def validate_and_sanitize_sql(sql: str) -> str:
             
     return sanitized_sql
 
-# --- FUNCIÓN DE EJECUCIÓN DE QUERIES ---
+# --- FUNCIÓN DE EJECUCIÓN ---
 def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int) -> List[Dict[str, Any]]:
     conn = None
     try:
@@ -110,8 +116,11 @@ if __name__ == "__main__":
     try:
         if args.host: mcp.settings.host = args.host
         if args.port: mcp.settings.port = int(args.port)
-        logger.info("Starting MCP Postgres server...")
-        mcp.run(transport=args.transport, mount_path=args.mount)
+        logger.info(f"Starting MCP Postgres server using {args.transport} transport on {mcp.settings.host}:{mcp.settings.port}")
+        if args.transport == "sse":
+            mcp.run(transport="sse", mount_path=args.mount)
+        else:
+            mcp.run(transport=args.transport)
     except Exception as e:
         logger.error(f"Server error: {str(e)}")
         sys.exit(1)

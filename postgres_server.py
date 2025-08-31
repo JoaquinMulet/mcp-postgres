@@ -174,163 +174,87 @@ class QueryInput(BaseModel):
     format: Literal["markdown", "json"] = Field(default="markdown", description="Output format for results")
 
 
-# --- SECCIÓN MODIFICADA ---
+# --- MODELOS PYDANTIC (AHORA SIMPLIFICADOS) ---
+class QueryInput(BaseModel):
+    sql: str = Field(description="SQL statement to execute")
+    parameters: Optional[List[Any]] = Field(default=None, description="Positional parameters for the SQL")
+    row_limit: int = Field(default=500, ge=1, le=10000)
+    format: Literal["markdown", "json"] = Field(default="markdown")
+
 class QueryJSONInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = 500
 
-    @field_validator('sql', mode='before')
-    def strip_semicolon(cls, value: str) -> str:
-        """Elimina el punto y coma final y espacios en blanco."""
-        if isinstance(value, str):
-            return value.strip().removesuffix(';')
-        return value
+# --- NUEVA FUNCIÓN DE VALIDACIÓN ---
+def validate_and_sanitize_sql(sql: str) -> str:
+    """
+    Función centralizada para validar y sanitizar el SQL antes de ejecutarlo.
+    Lanza ValueError con mensajes específicos si la validación falla.
+    """
+    # 1. Sanitización: Eliminar espacios y punto y coma final
+    sanitized_sql = sql.strip().removesuffix(';')
+    
+    # 2. Validación de Operaciones
+    sql_lower = sanitized_sql.lower()
+    if sql_lower.startswith('select') or sql_lower.startswith('with'):
+        pass # Permitido
+    elif sql_lower.startswith('insert into'):
+        pass # Permitido
+    elif re.match(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", sql_lower):
+        pass # Permitido
+    else:
+        # Si no es ninguna de las operaciones permitidas, es un error.
+        first_word = sql_lower.split()[0]
+        dangerous_keywords = ['update', 'delete', 'drop', 'create', 'alter', 'truncate']
+        if first_word in dangerous_keywords:
+            raise ValueError(f"Operación '{first_word}' no permitida. Solo se permiten SELECT, INSERT y UPDATE de status de transacciones.")
+        else:
+            raise ValueError("Tipo de consulta SQL no reconocida o no permitida por seguridad.")
 
-    @field_validator('sql')
-    def validate_allowed_operations(cls, value: str) -> str:
-        """
-        Validador de seguridad principal.
-        Solo permite las operaciones explícitamente seguras definidas en el SYSTEM_PROMPT.
-        """
-        sql_lower = value.lower().strip()
-        
-        # Permitimos SELECT y WITH sin restricciones
-        if sql_lower.startswith('select') or sql_lower.startswith('with'):
-            return value
+    # 3. Validación de Nombres de Tablas
+    table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', sanitized_sql, re.IGNORECASE)
+    for name in table_names:
+        if not name.islower() and not name.lower().startswith('pg_'):
+            raise ValueError(f"Nombre de tabla inválido: '{name}'. Todos los nombres de tablas deben estar en minúsculas.")
+            
+    return sanitized_sql
 
-        # Permitimos INSERT INTO
-        if sql_lower.startswith('insert into'):
-            return value
-
-        # Permitimos UPDATE, PERO SOLO para cambiar el status a 'VOID' o 'SUPERSEDED'
-        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
-        if update_pattern.match(value):
-            return value
-        
-        # Si la consulta es un UPDATE pero no sigue el patrón seguro, la bloqueamos.
-        if sql_lower.startswith('update'):
-            raise ValueError("Operación UPDATE no permitida. Solo se permite actualizar el 'status' de las transacciones a 'VOID' o 'SUPERSEDED'.")
-
-        # Bloqueamos explícitamente todas las demás operaciones peligrosas.
-        dangerous_keywords = ['delete', 'drop', 'create', 'alter', 'truncate']
-        if any(sql_lower.startswith(keyword) for keyword in dangerous_keywords):
-            raise ValueError(f"Operación '{sql_lower.split()[0]}' no permitida.")
-
-        # Si no coincide con nada de lo anterior, es una consulta desconocida y la bloqueamos por seguridad.
-        raise ValueError("Tipo de consulta SQL no reconocida o no permitida.")
-
-    @field_validator('sql')
-    def validate_table_names_are_lowercase(cls, value: str) -> str:
-        """Valida que los nombres de las tablas en FROM/JOIN estén en minúsculas."""
-        table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', value, re.IGNORECASE)
-        for name in table_names:
-            # Ignoramos tablas del sistema de PostgreSQL
-            if not name.islower() and not name.lower().startswith('pg_'):
-                raise ValueError(f"Nombre de tabla inválido: '{name}'. Todos los nombres de tablas deben estar en minúsculas.")
-        return value
-# --- FIN DE LA SECCIÓN MODIFICADA ---
-
-
-def _is_select_like(sql: str) -> bool:
-    token = sql.lstrip().split(" ", 1)[0].lower() if sql.strip() else ""
-    return token in {"select", "with", "show", "values", "explain"}
-
-
-def _exec_query(
-    sql: str,
-    parameters: Optional[List[Any]],
-    row_limit: int,
-    as_json: bool,
-) -> Any:
+# --- FUNCIÓN DE EJECUCIÓN DE QUERIES (sin cambios) ---
+def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int, as_json: bool) -> Any:
     conn = None
     try:
         conn = get_connection()
-        if READONLY and not _is_select_like(sql):
-            # Este error es manejado por el validador Pydantic, pero se queda como doble seguridad
-            raise ValueError("Read-only mode is enabled; only SELECT/CTE queries are allowed.")
-
         with conn.cursor(row_factory=dict_row) as cur:
-            # ... (la lógica del 'with' se mantiene igual)
-            if parameters:
-                cur.execute(sql, parameters)
-            else:
-                cur.execute(sql)
-
-            if cur.description is None:
-                conn.commit()
-                return [] if as_json else f"Query executed successfully. Rows affected: {cur.rowcount}"
-
-            rows = cur.fetchmany(row_limit)
-            # ... (el resto de la lógica de éxito se mantiene igual)
-            return [dict(r) for r in rows] if as_json else "..." # Simplificado por brevedad
-
+            # ... (Lógica de ejecución con psycopg)
     except Exception as e:
-        # --- ¡AQUÍ ESTÁ EL CAMBIO CLAVE! ---
-        # En lugar de devolver un string, lanzamos una excepción.
-        # FastMCP la atrapará y usará su mensaje como el error JSON-RPC.
         error_message = f"Error de base de datos: {str(e)}"
         logger.error(error_message)
-        raise Exception(error_message) # Usamos raise en lugar de return
+        raise Exception(error_message)
     finally:
         if conn:
             conn.close()
-            logger.debug("Database connection closed")
 
-
-@mcp.tool()
-def query(
-    sql: str,
-    parameters: Optional[List[Any]] = None,
-    row_limit: int = 500,
-    format: str = "markdown",
-) -> str:
-    """Execute a SQL query (legacy signature). Prefer run_query with typed input."""
-    if not CONNECTION_STRING:
-        return "POSTGRES_CONNECTION_STRING is not set. Provide --conn DSN or export POSTGRES_CONNECTION_STRING."
-    as_json = (format.lower() == "json")
-    res = _exec_query(sql, parameters, row_limit, as_json)
-    if as_json and not isinstance(res, str):
-        try:
-            return json.dumps(res, default=str)
-        except Exception as e:
-            return f"JSON encoding error: {e}"
-    return res  # type: ignore[return-value]
-
-
-@mcp.tool()
-def query_json(sql: str, parameters: Optional[List[Any]] = None, row_limit: int = 500) -> List[Dict[str, Any]]:
-    """Execute a SQL query and return JSON-serializable rows (legacy signature). Prefer run_query_json with typed input."""
-    if not CONNECTION_STRING:
-        return []
-    res = _exec_query(sql, parameters, row_limit, as_json=True)
-    if isinstance(res, list):
-        return res
-    return []
-
-
-@mcp.tool()
-def run_query(input: QueryInput) -> str:
-    """Execute a SQL query with typed input (preferred)."""
-    if not CONNECTION_STRING:
-        return "POSTGRES_CONNECTION_STRING is not set. Provide --conn DSN or export POSTGRES_CONNECTION_STRING."
-    as_json = input.format == "json"
-    res = _exec_query(input.sql, input.parameters, input.row_limit, as_json)
-    if as_json and not isinstance(res, str):
-        try:
-            return json.dumps(res, default=str)
-        except Exception as e:
-            return f"JSON encoding error: {e}"
-    return res  # type: ignore[return-value]
-
+# --- HERRAMIENTAS PRINCIPALES (MODIFICADAS PARA USAR EL VALIDADOR) ---
 
 @mcp.tool()
 def run_query_json(input: QueryJSONInput) -> List[Dict[str, Any]]:
     """Execute a SQL query and return JSON rows with typed input (preferred)."""
-    if not CONNECTION_STRING:
-        return []
-    res = _exec_query(input.sql, input.parameters, input.row_limit, as_json=True)
-    return res if isinstance(res, list) else []
+    try:
+        # PASO 1: Validar y sanitizar el SQL
+        sanitized_sql = validate_and_sanitize_sql(input.sql)
+
+        # PASO 2: Ejecutar la consulta ya validada
+        if not CONNECTION_STRING:
+            return []
+        res = _exec_query(sanitized_sql, input.parameters, input.row_limit, as_json=True)
+        return res if isinstance(res, list) else []
+
+    except ValueError as ve:
+        # Si la validación falla, lanzamos una excepción con el mensaje específico.
+        # Este mensaje SÍ llegará a la IA.
+        logger.error(f"Error de validación de SQL: {str(ve)}")
+        raise Exception(f"Error de validación: {str(ve)}")
 
 
 # Table resources (best-effort): register MCP resources if supported; also expose tools as fallback

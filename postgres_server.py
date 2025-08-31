@@ -11,60 +11,24 @@ import argparse
 import time
 import json
 import base64
-import re # <--- AÑADIR ESTA LÍNEA
-from pydantic import BaseModel, Field, field_validator # <--- MODIFICAR ESTA LÍNEA
+import re
+from pydantic import BaseModel, Field, validator
 from typing import Literal
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# --- CONFIGURACIÓN ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('postgres-mcp-server')
+mcp = FastMCP("PostgreSQL Explorer", log_level="INFO")
 
-mcp = FastMCP(
-    "PostgreSQL Explorer",
-    log_level="INFO"
-)
-
-# Connection string from --conn flag or POSTGRES_CONNECTION_STRING env var
 parser = argparse.ArgumentParser(description="PostgreSQL Explorer MCP server")
-parser.add_argument(
-    "--conn",
-    dest="conn",
-    default=os.getenv("POSTGRES_CONNECTION_STRING"),
-    help="PostgreSQL connection string or DSN"
-)
-parser.add_argument(
-    "--transport",
-    dest="transport",
-    choices=["stdio", "sse", "streamable-http"],
-    default=os.getenv("MCP_TRANSPORT", "stdio"),
-    help="Transport protocol: stdio (default), sse, or streamable-http",
-)
-parser.add_argument(
-    "--host",
-    dest="host",
-    default=os.getenv("MCP_HOST"),
-    help="Host to bind for SSE/HTTP transports (default 127.0.0.1)",
-)
-parser.add_argument(
-    "--port",
-    dest="port",
-    type=int,
-    default=os.getenv("MCP_PORT"),
-    help="Port to bind for SSE/HTTP transports (default 8000)",
-)
-parser.add_argument(
-    "--mount",
-    dest="mount",
-    default=os.getenv("MCP_SSE_MOUNT"),
-    help="Optional mount path for SSE transport (e.g., /mcp)",
-)
+parser.add_argument("--conn", dest="conn", default=os.getenv("POSTGRES_CONNECTION_STRING"), help="PostgreSQL connection string or DSN")
+parser.add_argument("--transport", dest="transport", choices=["stdio", "sse", "streamable-http"], default=os.getenv("MCP_TRANSPORT", "stdio"), help="Transport protocol")
+parser.add_argument("--host", dest="host", default=os.getenv("MCP_HOST"), help="Host to bind for SSE/HTTP transports")
+parser.add_argument("--port", dest="port", type=int, default=os.getenv("MCP_PORT"), help="Port to bind for SSE/HTTP transports")
+parser.add_argument("--mount", dest="mount", default=os.getenv("MCP_SSE_MOUNT"), help="Optional mount path for SSE transport")
 args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
-# Optional safety and performance controls via environment variables
 READONLY: bool = os.getenv("POSTGRES_READONLY", "false").lower() in {"1", "true", "yes"}
 STATEMENT_TIMEOUT_MS: Optional[int] = None
 try:
@@ -78,173 +42,54 @@ logger.info(
     ("to " + CONNECTION_STRING.split('@')[1]) if CONNECTION_STRING and '@' in CONNECTION_STRING else "(not set)"
 )
 
+# --- LÓGICA DE CONEXIÓN ---
 def get_connection():
     if not CONNECTION_STRING:
-        raise RuntimeError(
-            "POSTGRES_CONNECTION_STRING is not set. Provide --conn DSN or export POSTGRES_CONNECTION_STRING."
-        )
+        raise RuntimeError("POSTGRES_CONNECTION_STRING is not set.")
     try:
         conn = psycopg.connect(CONNECTION_STRING)
-        logger.debug("Database connection established successfully")
-        # Set session parameters for safety and observability
         with conn.cursor() as cur:
-            try:
-                cur.execute("SET application_name = %s", ("mcp-postgres",))
-                if STATEMENT_TIMEOUT_MS and STATEMENT_TIMEOUT_MS > 0:
-                    cur.execute("SET statement_timeout = %s", (STATEMENT_TIMEOUT_MS,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
+            cur.execute("SET application_name = %s", ("mcp-postgres",))
+            if STATEMENT_TIMEOUT_MS and STATEMENT_TIMEOUT_MS > 0:
+                cur.execute("SET statement_timeout = %s", (STATEMENT_TIMEOUT_MS,))
+            conn.commit()
         return conn
     except Exception as e:
         logger.error(f"Failed to establish database connection: {str(e)}")
         raise
 
-@mcp.tool()
-def server_info() -> Dict[str, Any]:
-    """Return server and environment info useful for clients."""
-    fastmcp_version = None
-    try:
-        import mcp.server.fastmcp as fastmcp_module  # type: ignore
-
-        fastmcp_version = getattr(fastmcp_module, "__version__", None)
-    except Exception:
-        pass
-
-    return {
-        "name": "PostgreSQL Explorer",
-        "readonly": READONLY,
-        "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
-        "fastmcp_version": fastmcp_version,
-        "psycopg_version": getattr(psycopg, "__version__", None),
-    }
-
-
-@mcp.tool()
-def db_identity() -> Dict[str, Any]:
-    """Return current DB identity details: db, user, host, port, search_path, server version, cluster name."""
-    conn = None
-    try:
-        try:
-            conn = get_connection()
-        except RuntimeError:
-            return {}
-
-        info: Dict[str, Any] = {}
-        with conn.cursor(row_factory=dict_row) as cur:
-            # Basic identity
-            cur.execute(
-                "SELECT current_database() AS database, current_user AS \"user\", "
-                "inet_server_addr()::text AS host, inet_server_port() AS port"
-            )
-            row = cur.fetchone()
-            if row:
-                info.update(dict(row))
-
-            # search_path
-            cur.execute("SELECT current_schemas(true) AS search_path")
-            row = cur.fetchone()
-            if row and "search_path" in row:
-                info["search_path"] = row["search_path"]
-
-            # version and cluster name
-            cur.execute(
-                "SELECT name, setting FROM pg_settings WHERE name IN ('server_version','cluster_name')"
-            )
-            rows = cur.fetchall() or []
-            for r in rows:
-                if r.get("name") == "server_version":
-                    info["server_version"] = r.get("setting")
-                elif r.get("name") == "cluster_name":
-                    info["cluster_name"] = r.get("setting")
-
-        return info
-    except Exception:
-        return {}
-    finally:
-        if conn:
-            conn.close()
-            logger.debug("Database connection closed")
-
-
+# --- MODELOS PYDANTIC (SIMPLIFICADOS) ---
 class QueryInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = 500
     format: Literal["markdown", "json"] = "markdown"
 
-
-# --- SECCIÓN MODIFICADA A PRUEBA DE VERSIONES ---
 class QueryJSONInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = 500
 
-    # Usamos la sintaxis de Pydantic v1, que es más compatible.
-    @validator('sql', pre=True, always=True)
-    def strip_semicolon(cls, value: str) -> str:
-        """Elimina el punto y coma final y espacios en blanco."""
-        if isinstance(value, str):
-            return value.strip().removesuffix(';')
-        return value
-
-    @validator('sql', always=True)
-    def validate_allowed_operations(cls, value: str) -> str:
-        """Validador de seguridad principal."""
-        sql_lower = value.lower().strip()
-        
-        if sql_lower.startswith(('select', 'with', 'insert into')):
-            return value
-
-        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
-        if update_pattern.match(value):
-            return value
-        
-        if sql_lower.startswith('update'):
-            raise ValueError("Operación UPDATE no permitida. Solo se permite actualizar el 'status' de las transacciones a 'VOID' o 'SUPERSEDED'.")
-
-        dangerous_keywords = ['delete', 'drop', 'create', 'alter', 'truncate']
-        if any(sql_lower.startswith(keyword) for keyword in dangerous_keywords):
-            raise ValueError(f"Operación '{sql_lower.split()[0]}' no permitida.")
-
-        raise ValueError("Tipo de consulta SQL no reconocida o no permitida.")
-
-    @validator('sql', always=True)
-    def validate_table_names_are_lowercase(cls, value: str) -> str:
-        """Valida que los nombres de las tablas en FROM/JOIN estén en minúsculas."""
-        table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', value, re.IGNORECASE)
-        for name in table_names:
-            if not name.islower() and not name.lower().startswith('pg_'):
-                raise ValueError(f"Nombre de tabla inválido: '{name}'. Todos los nombres de tablas deben estar en minúsculas.")
-        return value
-
-# --- NUEVA FUNCIÓN DE VALIDACIÓN ---
+# --- FUNCIÓN DE VALIDACIÓN CENTRALIZADA ---
 def validate_and_sanitize_sql(sql: str) -> str:
     """
-    Función centralizada para validar y sanitizar el SQL antes de ejecutarlo.
-    Lanza ValueError con mensajes específicos si la validación falla.
+    Valida y sanitiza el SQL. Lanza ValueError con mensajes específicos si falla.
     """
-    # 1. Sanitización: Eliminar espacios y punto y coma final
     sanitized_sql = sql.strip().removesuffix(';')
-    
-    # 2. Validación de Operaciones
     sql_lower = sanitized_sql.lower()
-    if sql_lower.startswith('select') or sql_lower.startswith('with'):
-        pass # Permitido
-    elif sql_lower.startswith('insert into'):
-        pass # Permitido
+
+    if sql_lower.startswith(('select', 'with', 'insert into')):
+        pass
     elif re.match(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", sql_lower):
-        pass # Permitido
+        pass
     else:
-        # Si no es ninguna de las operaciones permitidas, es un error.
-        first_word = sql_lower.split()[0]
+        first_word = sql_lower.split()[0] if sql_lower else ''
         dangerous_keywords = ['update', 'delete', 'drop', 'create', 'alter', 'truncate']
         if first_word in dangerous_keywords:
             raise ValueError(f"Operación '{first_word}' no permitida. Solo se permiten SELECT, INSERT y UPDATE de status de transacciones.")
         else:
             raise ValueError("Tipo de consulta SQL no reconocida o no permitida por seguridad.")
 
-    # 3. Validación de Nombres de Tablas
     table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', sanitized_sql, re.IGNORECASE)
     for name in table_names:
         if not name.islower() and not name.lower().startswith('pg_'):
@@ -252,7 +97,7 @@ def validate_and_sanitize_sql(sql: str) -> str:
             
     return sanitized_sql
 
-# --- FUNCIÓN DE EJECUCIÓN DE QUERIES (sin cambios) ---
+# --- FUNCIÓN DE EJECUCIÓN DE QUERIES ---
 def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int, as_json: bool) -> Any:
     conn = None
     try:
@@ -262,11 +107,28 @@ def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int, as_js
                 cur.execute(sql, parameters)
             else:
                 cur.execute(sql)
+            
             if cur.description is None:
                 conn.commit()
                 return [] if as_json else f"Query executed successfully. Rows affected: {cur.rowcount}"
+
             rows = cur.fetchmany(row_limit)
-            return [dict(r) for r in rows] if as_json else "Resultado en Markdown..."
+            if as_json:
+                return [dict(r) for r in rows]
+            
+            if not rows:
+                return "No results found"
+            
+            keys = list(rows[0].keys())
+            header = " | ".join(keys)
+            separator = " | ".join(["---"] * len(keys))
+            body_lines = []
+            for row in rows:
+                vals = [str(row.get(k, "NULL")) for k in keys]
+                body_lines.append(" | ".join(vals))
+            body = "\n".join(body_lines)
+            return f"Results:\n{header}\n{separator}\n{body}"
+
     except Exception as e:
         error_message = f"Error de base de datos: {str(e)}"
         logger.error(error_message)
@@ -275,560 +137,59 @@ def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int, as_js
         if conn:
             conn.close()
 
+# --- HERRAMIENTA PRINCIPAL ---
 @mcp.tool()
 def run_query_json(input: QueryJSONInput) -> List[Dict[str, Any]]:
+    """
+    Valida, sanitiza y ejecuta una consulta SQL, devolviendo filas JSON.
+    """
     try:
-        # Pydantic ya ha validado el input al crear el objeto 'input'.
-        # Ahora solo ejecutamos la consulta.
+        sanitized_sql = validate_and_sanitize_sql(input.sql)
+        
         if not CONNECTION_STRING:
             return []
-        res = _exec_query(input.sql, input.parameters, input.row_limit, as_json=True)
+        
+        res = _exec_query(sanitized_sql, input.parameters, input.row_limit, as_json=True)
         return res if isinstance(res, list) else []
+
     except ValueError as ve:
-        # Este bloque ahora es menos probable que se active, pero se mantiene como seguridad.
         logger.error(f"Error de validación de SQL: {str(ve)}")
         raise Exception(f"Error de validación: {str(ve)}")
 
-
-
-# Table resources (best-effort): register MCP resources if supported; also expose tools as fallback
-def _list_tables(schema: str = 'public') -> List[str]:
-    res = _exec_query(
-        sql=(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = %s ORDER BY table_name"
-        ),
-        parameters=[schema],
-        row_limit=10000,
-        as_json=True,
-    )
-    if isinstance(res, list):
-        return [r.get('table_name') for r in res if isinstance(r, dict) and 'table_name' in r]
-    return []
-
-
-def _read_table(schema: str, table: str, row_limit: int = 100) -> List[Dict[str, Any]]:
-    return _exec_query(
-        sql=f"SELECT * FROM {schema}.\"{table}\"",
-        parameters=None,
-        row_limit=row_limit,
-        as_json=True,
-    ) or []
-
-
+# --- OTRAS HERRAMIENTAS ÚTILES (OPCIONALES PERO RECOMENDADAS) ---
 @mcp.tool()
-def list_table_resources(schema: str = 'public') -> List[str]:
-    """List resource URIs for tables in a schema (fallback for clients without resource support)."""
-    return [f"table://{schema}/{t}" for t in _list_tables(schema)]
-
-
-@mcp.tool()
-def read_table_resource(schema: str, table: str, row_limit: int = 100) -> List[Dict[str, Any]]:
-    """Read rows from a table resource (fallback)."""
-    return _read_table(schema, table, row_limit)
-
-
-# Try to register proper MCP resources if available in FastMCP
-try:
-    resource_decorator = getattr(mcp, "resource")
-    if callable(resource_decorator):
-        @resource_decorator("table://{schema}/{table}")
-        def table_resource(schema: str, table: str, row_limit: int = 100):
-            """Resource reader for table rows."""
-            rows = _read_table(schema, table, row_limit)
-            # Return as JSON string to be universally consumable
-            return json.dumps(rows, default=str)
-except Exception as e:
-    logger.debug(f"Resource registration skipped: {e}")
-
-
-# Prompts: best-effort FastMCP prompt registration with tool fallbacks
-PROMPT_SAFE_SELECT = (
-    "Write a safe, read-only SELECT using placeholders. Avoid DML/DDL. "
-    "Prefer explicit column lists, add LIMIT, and filter with indexed columns when possible."
-)
-PROMPT_EXPLAIN_TIPS = (
-    "Use EXPLAIN (ANALYZE, BUFFERS, VERBOSE) to inspect plans. "
-    "Check seq vs index scans, join order, row estimates, and sort/hash nodes. Consider indexes or query rewrites."
-)
-
-try:
-    prompt_decorator = getattr(mcp, "prompt")
-    if callable(prompt_decorator):
-        @prompt_decorator("write_safe_select")
-        def prompt_write_safe_select():
-            return PROMPT_SAFE_SELECT
-
-        @prompt_decorator("explain_plan_tips")
-        def prompt_explain_plan_tips():
-            return PROMPT_EXPLAIN_TIPS
-except Exception as e:
-    logger.debug(f"Prompt registration skipped: {e}")
-
-
-@mcp.tool()
-def prompt_write_safe_select_tool() -> str:
-    """Prompt: guidelines for writing safe SELECT queries."""
-    return PROMPT_SAFE_SELECT
-
-
-@mcp.tool()
-def prompt_explain_plan_tips_tool() -> str:
-    """Prompt: tips for reading EXPLAIN ANALYZE output."""
-    return PROMPT_EXPLAIN_TIPS
-
-
-class ListSchemasInput(BaseModel):
-    include_system: bool = Field(default=False, description="Include pg_* and information_schema")
-    include_temp: bool = Field(default=False, description="Include temporary schemas (pg_temp_*)")
-    require_usage: bool = Field(default=True, description="Only list schemas with USAGE privilege")
-    row_limit: int = Field(default=10000, ge=1, le=100000, description="Maximum number of schemas to return")
-    name_like: Optional[str] = Field(default=None, description="Filter schema names by LIKE pattern (use % and _). '*' and '?' will be translated.")
-    case_sensitive: bool = Field(default=False, description="When true, use LIKE instead of ILIKE for name_like")
-
-
-@mcp.tool()
-def list_schemas_json(input: ListSchemasInput) -> List[Dict[str, Any]]:
-    """List schemas with filters and return JSON rows."""
-    # Build dynamic WHERE conditions based on inputs
-    conditions = []
-    params: List[Any] = []
-
-    if not input.include_system:
-        conditions.append("NOT (n.nspname = 'information_schema' OR n.nspname LIKE 'pg_%')")
-    if not input.include_temp:
-        conditions.append("n.nspname NOT LIKE 'pg_temp_%'")
-    if input.require_usage:
-        conditions.append("has_schema.priv")
-
-    # Name filter
-    if input.name_like:
-        pattern = input.name_like.replace('*', '%').replace('?', '_')
-        op = 'LIKE' if input.case_sensitive else 'ILIKE'
-        conditions.append(f"n.nspname {op} %s")
-        params.append(pattern)
-
-    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    limit_clause = " LIMIT %s"
-    params.append(input.row_limit)
-
-    sql = f"""
-    WITH has_schema AS (
-        SELECT n.oid AS oid, has_schema_privilege(n.nspname, 'USAGE') AS priv
-        FROM pg_namespace n
-    )
-    SELECT 
-        n.nspname AS schema_name,
-        pg_get_userbyid(n.nspowner) AS owner,
-        (n.nspname = 'information_schema' OR n.nspname LIKE 'pg_%') AS is_system,
-        (n.nspname LIKE 'pg_temp_%') AS is_temporary,
-        has_schema.priv AS has_usage
-    FROM pg_namespace n
-    JOIN has_schema ON has_schema.oid = n.oid
-    {where_clause}
-    ORDER BY n.nspname
-    {limit_clause}
-    """
-
-    res = _exec_query(sql, params, input.row_limit, as_json=True)
-    return res if isinstance(res, list) else []
-
-
-class ListSchemasPageInput(BaseModel):
-    include_system: bool = False
-    include_temp: bool = False
-    require_usage: bool = True
-    page_size: int = Field(default=500, ge=1, le=10000)
-    cursor: Optional[str] = None
-    name_like: Optional[str] = None
-    case_sensitive: bool = False
-
-
-@mcp.tool()
-def list_schemas_json_page(input: ListSchemasPageInput) -> Dict[str, Any]:
-    """List schemas with pagination and filters. Returns { items: [...], next_cursor: str|null }"""
-    # Decode cursor (simple base64-encoded JSON {"offset": int})
-    offset = 0
-    if input.cursor:
-        try:
-            payload = json.loads(base64.b64decode(input.cursor).decode('utf-8'))
-            offset = int(payload.get('offset', 0))
-        except Exception:
-            offset = 0
-
-    # Build conditions
-    conditions = []
-    params: List[Any] = []
-
-    if not input.include_system:
-        conditions.append("NOT (n.nspname = 'information_schema' OR n.nspname LIKE 'pg_%')")
-    if not input.include_temp:
-        conditions.append("n.nspname NOT LIKE 'pg_temp_%'")
-    if input.require_usage:
-        conditions.append("has_schema.priv")
-    if input.name_like:
-        pattern = input.name_like.replace('*', '%').replace('?', '_')
-        op = 'LIKE' if input.case_sensitive else 'ILIKE'
-        conditions.append(f"n.nspname {op} %s")
-        params.append(pattern)
-
-    where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    # Fetch one extra to determine if there is a next page
-    limit = input.page_size + 1
-    sql = f"""
-    WITH has_schema AS (
-        SELECT n.oid AS oid, has_schema_privilege(n.nspname, 'USAGE') AS priv
-        FROM pg_namespace n
-    )
-    SELECT 
-        n.nspname AS schema_name,
-        pg_get_userbyid(n.nspowner) AS owner,
-        (n.nspname = 'information_schema' OR n.nspname LIKE 'pg_%') AS is_system,
-        (n.nspname LIKE 'pg_temp_%') AS is_temporary,
-        has_schema.priv AS has_usage
-    FROM pg_namespace n
-    JOIN has_schema ON has_schema.oid = n.oid
-    {where_clause}
-    ORDER BY n.nspname
-    LIMIT %s OFFSET %s
-    """
-    params_with_pagination = params + [limit, offset]
-    rows = _exec_query(sql, params_with_pagination, limit, as_json=True)
-    items: List[Dict[str, Any]] = []
-    next_cursor: Optional[str] = None
-    if isinstance(rows, list):
-        if len(rows) > input.page_size:
-            items = rows[: input.page_size]
-            next_cursor = base64.b64encode(json.dumps({"offset": offset + input.page_size}).encode('utf-8')).decode('utf-8')
-        else:
-            items = rows
-
-    return {"items": items, "next_cursor": next_cursor}
-
-
-class ListTablesInput(BaseModel):
-    db_schema: Optional[str] = Field(default=None, description="Schema to list tables from; defaults to current_schema()")
-    name_like: Optional[str] = Field(default=None, description="Filter table_name by pattern; '*' and '?' translate to SQL wildcards")
-    case_sensitive: bool = Field(default=False, description="Use LIKE (true) or ILIKE (false) for name_like")
-    table_types: Optional[List[str]] = Field(
-        default=None,
-        description="Limit to specific information_schema table_type values (e.g., 'BASE TABLE','VIEW')",
-    )
-    row_limit: int = Field(default=10000, ge=1, le=100000)
-
-
-@mcp.tool()
-def list_tables_json(input: ListTablesInput) -> List[Dict[str, Any]]:
-    """List tables in a schema with optional filters and return JSON rows."""
-    eff_schema = input.db_schema or _get_current_schema()
-
-    conditions = ["table_schema = %s"]
-    params: List[Any] = [eff_schema]
-
-    if input.name_like:
-        pattern = input.name_like.replace('*', '%').replace('?', '_')
-        op = 'LIKE' if input.case_sensitive else 'ILIKE'
-        conditions.append(f"table_name {op} %s")
-        params.append(pattern)
-
-    if input.table_types:
-        placeholders = ",".join(["%s"] * len(input.table_types))
-        conditions.append(f"table_type IN ({placeholders})")
-        params.extend(input.table_types)
-
-    where_clause = " AND ".join(conditions)
-
-    sql = f"""
-    SELECT table_name, table_type
-    FROM information_schema.tables
-    WHERE {where_clause}
-    ORDER BY table_name
-    LIMIT %s
-    """
-    params.append(input.row_limit)
-
-    res = _exec_query(sql, params, input.row_limit, as_json=True)
-    return res if isinstance(res, list) else []
-
-
-class ListTablesPageInput(BaseModel):
-    db_schema: Optional[str] = None
-    name_like: Optional[str] = None
-    case_sensitive: bool = False
-    table_types: Optional[List[str]] = None
-    page_size: int = Field(default=500, ge=1, le=10000)
-    cursor: Optional[str] = None
-
-
-@mcp.tool()
-def list_tables_json_page(input: ListTablesPageInput) -> Dict[str, Any]:
-    """List tables with pagination and filters. Returns { items, next_cursor }."""
-    eff_schema = input.db_schema or _get_current_schema()
-
-    # Decode cursor
-    offset = 0
-    if input.cursor:
-        try:
-            payload = json.loads(base64.b64decode(input.cursor).decode('utf-8'))
-            offset = int(payload.get('offset', 0))
-        except Exception:
-            offset = 0
-
-    conditions = ["table_schema = %s"]
-    params: List[Any] = [eff_schema]
-
-    if input.name_like:
-        pattern = input.name_like.replace('*', '%').replace('?', '_')
-        op = 'LIKE' if input.case_sensitive else 'ILIKE'
-        conditions.append(f"table_name {op} %s")
-        params.append(pattern)
-
-    if input.table_types:
-        placeholders = ",".join(["%s"] * len(input.table_types))
-        conditions.append(f"table_type IN ({placeholders})")
-        params.extend(input.table_types)
-
-    where_clause = " AND ".join(conditions)
-    limit = input.page_size + 1
-
-    sql = f"""
-    SELECT table_name, table_type
-    FROM information_schema.tables
-    WHERE {where_clause}
-    ORDER BY table_name
-    LIMIT %s OFFSET %s
-    """
-    params_with_pagination = params + [limit, offset]
-    rows = _exec_query(sql, params_with_pagination, limit, as_json=True)
-
-    items: List[Dict[str, Any]] = []
-    next_cursor: Optional[str] = None
-    if isinstance(rows, list):
-        if len(rows) > input.page_size:
-            items = rows[: input.page_size]
-            next_cursor = base64.b64encode(json.dumps({"offset": offset + input.page_size}).encode('utf-8')).decode('utf-8')
-        else:
-            items = rows
-
-    return {"items": items, "next_cursor": next_cursor}
-
-@mcp.tool()
-def list_schemas() -> str:
-    """List all schemas in the database."""
-    logger.info("Listing database schemas")
-    # Increase row limit to avoid truncation in large catalogs
-    return query(
-        "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
-        None,
-        10000,
-    )
-
-def _get_current_schema() -> str:
+def db_identity() -> Dict[str, Any]:
+    """Return current DB identity details."""
+    conn = None
     try:
-        res = _exec_query("SELECT current_schema() AS schema", None, 1, as_json=True)
-        if isinstance(res, list) and res:
-            schema = res[0].get("schema")
-            if isinstance(schema, str) and schema:
-                return schema
-    except Exception:
-        pass
-    return "public"
-
-
-@mcp.tool()
-def list_tables(db_schema: Optional[str] = None) -> str:
-    """List all tables in a specific schema.
-    
-    Args:
-        db_schema: The schema name to list tables from (defaults to 'public')
-    """
-    eff_schema = db_schema or _get_current_schema()
-    logger.info(f"Listing tables in schema: {eff_schema}")
-    sql = """
-    SELECT table_name, table_type
-    FROM information_schema.tables
-    WHERE table_schema = %s
-    ORDER BY table_name
-    """
-    return query(sql, [eff_schema])
-
-@mcp.tool()
-def describe_table(table_name: str, db_schema: Optional[str] = None) -> str:
-    """Get detailed information about a table.
-    
-    Args:
-        table_name: The name of the table to describe
-        db_schema: The schema name (defaults to 'public')
-    """
-    eff_schema = db_schema or _get_current_schema()
-    logger.info(f"Describing table: {eff_schema}.{table_name}")
-    sql = """
-    SELECT 
-        column_name,
-        data_type,
-        is_nullable,
-        column_default,
-        character_maximum_length
-    FROM information_schema.columns
-    WHERE table_schema = %s AND table_name = %s
-    ORDER BY ordinal_position
-    """
-    return query(sql, [eff_schema, table_name])
-
-@mcp.tool()
-def get_foreign_keys(table_name: str, db_schema: Optional[str] = None) -> str:
-    """Get foreign key information for a table.
-    
-    Args:
-        table_name: The name of the table to get foreign keys from
-        db_schema: The schema name (defaults to 'public')
-    """
-    eff_schema = db_schema or _get_current_schema()
-    logger.info(f"Getting foreign keys for table: {eff_schema}.{table_name}")
-    sql = """
-    SELECT 
-        tc.constraint_name,
-        kcu.column_name as fk_column,
-        ccu.table_schema as referenced_schema,
-        ccu.table_name as referenced_table,
-        ccu.column_name as referenced_column
-    FROM information_schema.table_constraints tc
-    JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-    JOIN information_schema.referential_constraints rc
-        ON tc.constraint_name = rc.constraint_name
-    JOIN information_schema.constraint_column_usage ccu
-        ON rc.unique_constraint_name = ccu.constraint_name
-    WHERE tc.constraint_type = 'FOREIGN KEY'
-        AND tc.table_schema = %s
-        AND tc.table_name = %s
-    ORDER BY tc.constraint_name, kcu.ordinal_position
-    """
-    return query(sql, [eff_schema, table_name])
-
-@mcp.tool()
-def find_relationships(table_name: str, db_schema: Optional[str] = None) -> str:
-    """Find both explicit and implied relationships for a table.
-    
-    Args:
-        table_name: The name of the table to analyze relationships for
-        db_schema: The schema name (defaults to 'public')
-    """
-    eff_schema = db_schema or _get_current_schema()
-    logger.info(f"Finding relationships for table: {eff_schema}.{table_name}")
-    try:
-        # First get explicit foreign key relationships
-        fk_sql = """
-        SELECT 
-            kcu.column_name,
-            ccu.table_name as foreign_table,
-            ccu.column_name as foreign_column,
-            'Explicit FK' as relationship_type,
-            1 as confidence_level
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu 
-            ON tc.constraint_name = kcu.constraint_name
-            AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage ccu
-            ON ccu.constraint_name = tc.constraint_name
-            AND ccu.table_schema = tc.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-            AND tc.table_schema = %s
-            AND tc.table_name = %s
-        """
-        
-        logger.debug("Querying explicit foreign key relationships")
-        explicit_results = query(fk_sql, [eff_schema, table_name])
-        
-        # Then look for implied relationships based on common patterns
-        logger.debug("Querying implied relationships")
-        implied_sql = """
-        WITH source_columns AS (
-            -- Get all ID-like columns from our table
-            SELECT column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema = %s 
-            AND table_name = %s
-            AND (
-                column_name LIKE '%%id' 
-                OR column_name LIKE '%%_id'
-                OR column_name LIKE '%%_fk'
+        conn = get_connection()
+        info: Dict[str, Any] = {}
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT current_database() AS database, current_user AS \"user\", "
+                "inet_server_addr()::text AS host, inet_server_port() AS port"
             )
-        ),
-        potential_references AS (
-            -- Find tables that might be referenced by our ID columns
-            SELECT DISTINCT
-                sc.column_name as source_column,
-                sc.data_type as source_type,
-                t.table_name as target_table,
-                c.column_name as target_column,
-                c.data_type as target_type,
-                CASE
-                    -- Highest confidence: column matches table_id pattern and types match
-                    WHEN sc.column_name = t.table_name || '_id' 
-                        AND sc.data_type = c.data_type THEN 2
-                    -- High confidence: column ends with _id and types match
-                    WHEN sc.column_name LIKE '%%_id' 
-                        AND sc.data_type = c.data_type THEN 3
-                    -- Medium confidence: column contains table name and types match
-                    WHEN sc.column_name LIKE '%%' || t.table_name || '%%'
-                        AND sc.data_type = c.data_type THEN 4
-                    -- Lower confidence: column ends with id and types match
-                    WHEN sc.column_name LIKE '%%id'
-                        AND sc.data_type = c.data_type THEN 5
-                END as confidence_level
-            FROM source_columns sc
-            CROSS JOIN information_schema.tables t
-            JOIN information_schema.columns c 
-                ON c.table_schema = t.table_schema 
-                AND c.table_name = t.table_name
-                AND (c.column_name = 'id' OR c.column_name = sc.column_name)
-            WHERE t.table_schema = %s
-                AND t.table_name != %s  -- Exclude self-references
-        )
-        SELECT 
-            source_column as column_name,
-            target_table as foreign_table,
-            target_column as foreign_column,
-            CASE 
-                WHEN confidence_level = 2 THEN 'Strong implied relationship (exact match)'
-                WHEN confidence_level = 3 THEN 'Strong implied relationship (_id pattern)'
-                WHEN confidence_level = 4 THEN 'Likely implied relationship (name match)'
-                ELSE 'Possible implied relationship'
-            END as relationship_type,
-            confidence_level
-        FROM potential_references
-        WHERE confidence_level IS NOT NULL
-        ORDER BY confidence_level, source_column;
-        """
-        implied_results = query(implied_sql, [eff_schema, table_name])
-        
-        return "Explicit Relationships:\n" + explicit_results + "\n\nImplied Relationships:\n" + implied_results
-        
-    except Exception as e:
-        error_msg = f"Error finding relationships: {str(e)}"
-        logger.error(error_msg)
-        return error_msg
+            row = cur.fetchone()
+            if row: info.update(dict(row))
+            cur.execute("SELECT current_schemas(true) AS search_path")
+            row = cur.fetchone()
+            if row and "search_path" in row: info["search_path"] = row["search_path"]
+        return info
+    finally:
+        if conn: conn.close()
 
+@mcp.tool()
+def list_tables(db_schema: Optional[str] = 'public') -> str:
+    """List all tables in a specific schema."""
+    sql = "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = %s ORDER BY table_name"
+    return _exec_query(sql, [db_schema], 1000, as_json=False)
+
+# --- BLOQUE DE EJECUCIÓN ---
 if __name__ == "__main__":
     try:
-        # Configure host/port for network transports if provided
-        if args.host:
-            mcp.settings.host = args.host
-        if args.port:
-            try:
-                mcp.settings.port = int(args.port)
-            except Exception:
-                pass
-
-        logger.info(
-            "Starting MCP Postgres server using %s transport on %s:%s",
-            args.transport,
-            mcp.settings.host,
-            mcp.settings.port,
-        )
+        if args.host: mcp.settings.host = args.host
+        if args.port: mcp.settings.port = int(args.port)
+        logger.info("Starting MCP Postgres server using %s transport on %s:%s", args.transport, mcp.settings.host, mcp.settings.port)
         if args.transport == "sse":
             mcp.run(transport="sse", mount_path=args.mount)
         else:

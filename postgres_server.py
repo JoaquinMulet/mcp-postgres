@@ -168,23 +168,55 @@ def db_identity() -> Dict[str, Any]:
 
 
 class QueryInput(BaseModel):
-    sql: str = Field(description="SQL statement to execute")
-    parameters: Optional[List[Any]] = Field(default=None, description="Positional parameters for the SQL")
-    row_limit: int = Field(default=500, ge=1, le=10000, description="Max rows to return for SELECT queries")
-    format: Literal["markdown", "json"] = Field(default="markdown", description="Output format for results")
+    sql: str
+    parameters: Optional[List[Any]] = None
+    row_limit: int = 500
+    format: Literal["markdown", "json"] = "markdown"
 
 
-# --- MODELOS PYDANTIC (AHORA SIMPLIFICADOS) ---
-class QueryInput(BaseModel):
-    sql: str = Field(description="SQL statement to execute")
-    parameters: Optional[List[Any]] = Field(default=None, description="Positional parameters for the SQL")
-    row_limit: int = Field(default=500, ge=1, le=10000)
-    format: Literal["markdown", "json"] = Field(default="markdown")
-
+# --- SECCIÓN MODIFICADA A PRUEBA DE VERSIONES ---
 class QueryJSONInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = 500
+
+    # Usamos la sintaxis de Pydantic v1, que es más compatible.
+    @validator('sql', pre=True, always=True)
+    def strip_semicolon(cls, value: str) -> str:
+        """Elimina el punto y coma final y espacios en blanco."""
+        if isinstance(value, str):
+            return value.strip().removesuffix(';')
+        return value
+
+    @validator('sql', always=True)
+    def validate_allowed_operations(cls, value: str) -> str:
+        """Validador de seguridad principal."""
+        sql_lower = value.lower().strip()
+        
+        if sql_lower.startswith(('select', 'with', 'insert into')):
+            return value
+
+        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
+        if update_pattern.match(value):
+            return value
+        
+        if sql_lower.startswith('update'):
+            raise ValueError("Operación UPDATE no permitida. Solo se permite actualizar el 'status' de las transacciones a 'VOID' o 'SUPERSEDED'.")
+
+        dangerous_keywords = ['delete', 'drop', 'create', 'alter', 'truncate']
+        if any(sql_lower.startswith(keyword) for keyword in dangerous_keywords):
+            raise ValueError(f"Operación '{sql_lower.split()[0]}' no permitida.")
+
+        raise ValueError("Tipo de consulta SQL no reconocida o no permitida.")
+
+    @validator('sql', always=True)
+    def validate_table_names_are_lowercase(cls, value: str) -> str:
+        """Valida que los nombres de las tablas en FROM/JOIN estén en minúsculas."""
+        table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', value, re.IGNORECASE)
+        for name in table_names:
+            if not name.islower() and not name.lower().startswith('pg_'):
+                raise ValueError(f"Nombre de tabla inválido: '{name}'. Todos los nombres de tablas deben estar en minúsculas.")
+        return value
 
 # --- NUEVA FUNCIÓN DE VALIDACIÓN ---
 def validate_and_sanitize_sql(sql: str) -> str:
@@ -226,7 +258,15 @@ def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int, as_js
     try:
         conn = get_connection()
         with conn.cursor(row_factory=dict_row) as cur:
-            # ... (Lógica de ejecución con psycopg)
+            if parameters:
+                cur.execute(sql, parameters)
+            else:
+                cur.execute(sql)
+            if cur.description is None:
+                conn.commit()
+                return [] if as_json else f"Query executed successfully. Rows affected: {cur.rowcount}"
+            rows = cur.fetchmany(row_limit)
+            return [dict(r) for r in rows] if as_json else "Resultado en Markdown..."
     except Exception as e:
         error_message = f"Error de base de datos: {str(e)}"
         logger.error(error_message)
@@ -235,26 +275,20 @@ def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int, as_js
         if conn:
             conn.close()
 
-# --- HERRAMIENTAS PRINCIPALES (MODIFICADAS PARA USAR EL VALIDADOR) ---
-
 @mcp.tool()
 def run_query_json(input: QueryJSONInput) -> List[Dict[str, Any]]:
-    """Execute a SQL query and return JSON rows with typed input (preferred)."""
     try:
-        # PASO 1: Validar y sanitizar el SQL
-        sanitized_sql = validate_and_sanitize_sql(input.sql)
-
-        # PASO 2: Ejecutar la consulta ya validada
+        # Pydantic ya ha validado el input al crear el objeto 'input'.
+        # Ahora solo ejecutamos la consulta.
         if not CONNECTION_STRING:
             return []
-        res = _exec_query(sanitized_sql, input.parameters, input.row_limit, as_json=True)
+        res = _exec_query(input.sql, input.parameters, input.row_limit, as_json=True)
         return res if isinstance(res, list) else []
-
     except ValueError as ve:
-        # Si la validación falla, lanzamos una excepción con el mensaje específico.
-        # Este mensaje SÍ llegará a la IA.
+        # Este bloque ahora es menos probable que se active, pero se mantiene como seguridad.
         logger.error(f"Error de validación de SQL: {str(ve)}")
         raise Exception(f"Error de validación: {str(ve)}")
+
 
 
 # Table resources (best-effort): register MCP resources if supported; also expose tools as fallback

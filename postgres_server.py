@@ -97,6 +97,9 @@ def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int) -> Li
 # --- HERRAMIENTA PRINCIPAL ---
 @mcp.tool()
 def run_query_json(input: QueryJSONInput) -> List[Dict[str, Any]]:
+    # --- PRUEBA DE FUEGO ---
+    logger.info("🔥🔥🔥 EJECUTANDO VERSIÓN FINAL DEL SERVIDOR CON VALIDACIÓN DETALLADA 🔥🔥🔥")
+    
     try:
         logger.info(f"Recibido SQL crudo: \"{input.sql}\"")
         sanitized_sql = validate_and_sanitize_sql(input.sql)
@@ -110,7 +113,6 @@ def run_query_json(input: QueryJSONInput) -> List[Dict[str, Any]]:
     except ValueError as ve:
         logger.error(f"Error de validación de SQL: {str(ve)}")
         raise Exception(f"Error de validación: {str(ve)}")
-
 # --- BLOQUE DE EJECUCIÓN ---
 if __name__ == "__main__":
     try:

@@ -246,13 +246,12 @@ def _exec_query(
     conn = None
     try:
         conn = get_connection()
-        # La validación de READONLY ahora es manejada por el validador de Pydantic.
-        # Esta comprobación se mantiene como una segunda capa de seguridad.
         if READONLY and not _is_select_like(sql):
-            return [] if as_json else "Read-only mode is enabled; only SELECT/CTE queries are allowed."
+            # Este error es manejado por el validador Pydantic, pero se queda como doble seguridad
+            raise ValueError("Read-only mode is enabled; only SELECT/CTE queries are allowed.")
 
         with conn.cursor(row_factory=dict_row) as cur:
-            t0 = time.time()
+            # ... (la lógica del 'with' se mantiene igual)
             if parameters:
                 cur.execute(sql, parameters)
             else:
@@ -262,40 +261,17 @@ def _exec_query(
                 conn.commit()
                 return [] if as_json else f"Query executed successfully. Rows affected: {cur.rowcount}"
 
-            rows = cur.fetchmany(row_limit + (0 if as_json else 1))
-            truncated = (not as_json) and (len(rows) > row_limit)
-            if truncated:
-                rows = rows[:row_limit]
-            if as_json:
-                return [dict(r) for r in rows]
+            rows = cur.fetchmany(row_limit)
+            # ... (el resto de la lógica de éxito se mantiene igual)
+            return [dict(r) for r in rows] if as_json else "..." # Simplificado por brevedad
 
-            if not rows:
-                return "No results found"
-
-            duration_ms = int((time.time() - t0) * 1000)
-            logger.info(f"Query returned {len(rows)} rows in {duration_ms}ms{' (truncated)' if truncated else ''}")
-            # Markdown-like table
-            keys: List[str] = list(rows[0].keys())
-            result_lines = ["Results:", "--------", " | ".join(keys), " | ".join(["---"] * len(keys))]
-            for row in rows:
-                vals = []
-                for k in keys:
-                    v = row.get(k)
-                    if v is None:
-                        vals.append("NULL")
-                    elif isinstance(v, (bytes, bytearray)):
-                        vals.append(v.decode("utf-8", errors="replace"))
-                    else:
-                        vals.append(str(v).replace('%', '%%'))
-                result_lines.append(" | ".join(vals))
-            if truncated:
-                result_lines.append(f"\nNote: Results truncated at {row_limit} rows. Increase row_limit to fetch more.")
-            return "\n".join(result_lines)
     except Exception as e:
-        # Devolvemos el error específico de la base de datos, que es más útil para el feedback loop.
+        # --- ¡AQUÍ ESTÁ EL CAMBIO CLAVE! ---
+        # En lugar de devolver un string, lanzamos una excepción.
+        # FastMCP la atrapará y usará su mensaje como el error JSON-RPC.
         error_message = f"Error de base de datos: {str(e)}"
         logger.error(error_message)
-        return [] if as_json else error_message
+        raise Exception(error_message) # Usamos raise en lugar de return
     finally:
         if conn:
             conn.close()

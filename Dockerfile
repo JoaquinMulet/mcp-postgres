@@ -1,41 +1,25 @@
-# Stage 1: "builder" - Instala las dependencias en un entorno robusto
-FROM python:3.11-bullseye as builder
+# Usa una versión de Python reciente y 'slim' para una imagen más pequeña.
+FROM python:3.11-slim
 
-# Instala las dependencias del sistema necesarias para compilar algunas librerías de Python
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev
-
-# Crea un entorno de trabajo y un entorno virtual
+# Establece el directorio de trabajo dentro del contenedor.
 WORKDIR /app
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
 
-# Copia e instala los requerimientos
+# --- OPTIMIZACIÓN DE CACHÉ ---
+# 1. Copia SOLO el archivo de requerimientos primero.
 COPY requirements.txt .
+
+# 2. Instala las dependencias.
+# Docker creará una capa aquí. Si requirements.txt no cambia,
+# esta capa se reutilizará en futuras construcciones, ahorrando mucho tiempo.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Stage 2: "final" - Construye la imagen de producción ligera
-FROM python:3.11-slim-bullseye
-
-# Instala SOLO las librerías de sistema necesarias para EJECUTAR la aplicación
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Copia el entorno virtual con las dependencias desde la etapa "builder"
-COPY --from=builder /opt/venv /opt/venv
-
-# Copia el código de tu aplicación
+# 3. Ahora copia el resto del código de tu aplicación.
+# Como el código cambia más a menudo, solo esta capa se reconstruirá.
 COPY . .
 
-# Activa el entorno virtual para los comandos que se ejecuten
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Expone el puerto que la aplicación usará internamente
+# Expone el puerto en el que la aplicación escuchará.
 EXPOSE 8000
 
-# El comando por defecto. Tu "Start Command" en la plataforma de deploy lo sobreescribirá.
-CMD ["python", "postgres_server.py"]
+# Define el comando por defecto para iniciar el servidor.
+# El "Start Command" de Railway puede sobreescribir esto.
+CMD ["python", "postgre_server.py", "--host", "0.0.0.0"]

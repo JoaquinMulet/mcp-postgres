@@ -1,128 +1,114 @@
-# postgres_server.py
-
-from typing import Any, Optional, List, Dict
-import psycopg
-from psycopg.rows import dict_row
-from mcp.server.fastmcp import FastMCP
-import sys
-import logging
 import os
-import argparse
-import time
 import json
-import base64
-import re
+from typing import List, Dict, Any
+
+import psycopg
 from pydantic import BaseModel, Field
-from typing import Literal
+from fastmcp import FastMCP, Context
 
 # --- CONFIGURACIÓN ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('postgres-mcp-server')
-mcp = FastMCP("PostgreSQL Explorer", log_level="INFO")
+# Carga la URL de la base de datos desde las variables de entorno.
+# Es una práctica de seguridad fundamental no tener credenciales en el código.
+# Tu plataforma de despliegue (como Railway o Render) te permitirá configurar esto.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- DEFINICIÓN DE ARGUMENTOS (SECCIÓN CORREGIDA) ---
-parser = argparse.ArgumentParser(description="PostgreSQL Explorer MCP server")
-parser.add_argument("--conn", dest="conn", default=os.getenv("POSTGRES_CONNECTION_STRING"), help="PostgreSQL connection string or DSN")
-parser.add_argument("--transport", dest="transport", choices=["stdio", "sse", "streamable-http"], default=os.getenv("MCP_TRANSPORT", "stdio"), help="Transport protocol")
-parser.add_argument("--host", dest="host", default=os.getenv("MCP_HOST", "127.0.0.1"), help="Host to bind for SSE/HTTP transports")
-parser.add_argument("--port", dest="port", type=int, default=os.getenv("MCP_PORT", 8000), help="Port to bind for SSE/HTTP transports")
-parser.add_argument("--mount", dest="mount", default=os.getenv("MCP_SSE_MOUNT"), help="Optional mount path for SSE transport")
-args, _ = parser.parse_known_args()
-CONNECTION_STRING: Optional[str] = args.conn
+if not DATABASE_URL:
+    raise ValueError("La variable de entorno DATABASE_URL no está configurada.")
 
-# ... (El resto del código hasta el bloque de ejecución se mantiene igual) ...
+# --- MODELOS DE DATOS (PYDANTIC) ---
+# Definimos un modelo para la entrada de nuestra herramienta.
+# FastMCP usará esto para validar automáticamente las solicitudes entrantes.
+# Esto resuelve el problema original de "Invalid request parameters".
+class QueryInput(BaseModel):
+    """Modelo de entrada para ejecutar una consulta SQL."""
+    sql: str = Field(
+        ..., # '...' indica que este campo es obligatorio.
+        description="La consulta SQL completa a ejecutar en la base de datos PostgreSQL."
+    )
+    row_limit: int = Field(
+        default=100,
+        description="El número máximo de filas a devolver. Por defecto es 100."
+    )
 
-# --- LÓGICA DE CONEXIÓN ---
-def get_connection():
-    if not CONNECTION_STRING:
-        raise RuntimeError("POSTGRES_CONNECTION_STRING is not set.")
-    try:
-        conn = psycopg.connect(CONNECTION_STRING)
-        with conn.cursor() as cur:
-            cur.execute("SET application_name = %s", ("mcp-postgres",))
-        return conn
-    except Exception as e:
-        logger.error(f"Failed to establish database connection: {str(e)}")
-        raise
+# --- INICIALIZACIÓN DEL SERVIDOR MCP ---
+# Instanciamos el servidor FastMCP. El nombre es visible en herramientas como Claude Desktop.
+# Especificamos las dependencias que `fastmcp` debe instalar al desplegar el servidor.
+mcp = FastMCP(
+    "Postgres Finance Agent Server",
+    dependencies=["psycopg[binary]>=3.1.0", "pydantic>=2.6.0"]
+)
 
-# --- MODELOS PYDANTIC ---
-class QueryJSONInput(BaseModel):
-    sql: str
-    parameters: Optional[List[Any]] = None
-    row_limit: int = 500
-
-# --- FUNCIÓN DE VALIDACIÓN ---
-def validate_and_sanitize_sql(sql: str) -> str:
-    sanitized_sql = sql.strip().removesuffix(';')
-    sql_lower = sanitized_sql.lower()
-
-    if sql_lower.startswith(('select', 'with', 'insert into')):
-        pass
-    elif re.match(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", sql_lower):
-        pass
-    else:
-        first_word = sql_lower.split()[0] if sql_lower else ''
-        dangerous_keywords = ['update', 'delete', 'drop', 'create', 'alter', 'truncate']
-        if first_word in dangerous_keywords:
-            raise ValueError(f"Operación '{first_word}' no permitida.")
-        else:
-            raise ValueError("Tipo de consulta SQL no reconocida o no permitida por seguridad.")
-
-    table_names = re.findall(r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)', sanitized_sql, re.IGNORECASE)
-    for name in table_names:
-        if not name.islower() and not name.lower().startswith('pg_'):
-            raise ValueError(f"Nombre de tabla inválido: '{name}'. Todos los nombres de tablas deben estar en minúsculas.")
-            
-    return sanitized_sql
-
-# --- FUNCIÓN DE EJECUCIÓN ---
-def _exec_query(sql: str, parameters: Optional[List[Any]], row_limit: int) -> List[Dict[str, Any]]:
-    conn = None
-    try:
-        conn = get_connection()
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, parameters)
-            if cur.description is None:
-                conn.commit()
-                return []
-            return [dict(r) for r in cur.fetchmany(row_limit)]
-    except Exception as e:
-        error_message = f"Error de base de datos: {str(e)}"
-        logger.error(error_message)
-        raise Exception(error_message)
-    finally:
-        if conn:
-            conn.close()
-
-# --- HERRAMIENTA PRINCIPAL ---
+# --- DEFINICIÓN DE HERRAMIENTAS ---
 @mcp.tool()
-def run_query_json(input: QueryJSONInput) -> List[Dict[str, Any]]:
-    # --- PRUEBA DE FUEGO ---
-    logger.info("🔥🔥🔥 EJECUTANDO VERSIÓN FINAL DEL SERVIDOR CON VALIDACIÓN DETALLADA 🔥🔥🔥")
-    
-    try:
-        logger.info(f"Recibido SQL crudo: \"{input.sql}\"")
-        sanitized_sql = validate_and_sanitize_sql(input.sql)
-        logger.info(f"Ejecutando SQL sanitizado: \"{sanitized_sql}\"")
-        
-        if not CONNECTION_STRING:
-            return []
-        
-        return _exec_query(sanitized_sql, input.parameters, input.row_limit)
+def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]:
+    """
+    Ejecuta de forma segura una consulta SQL en la base de datos PostgreSQL y devuelve
+    los resultados en formato JSON. Solo se deben ejecutar consultas de lectura (SELECT)
+    o de escritura seguras (INSERT, UPDATE) según lo indique el agente.
+    """
+    ctx.info(f"Recibida solicitud para ejecutar SQL. Límite de filas: {input.row_limit}")
+    ctx.info(f"SQL: {input.sql}")
 
-    except ValueError as ve:
-        logger.error(f"Error de validación de SQL: {str(ve)}")
-        raise Exception(f"Error de validación: {str(ve)}")
-# --- BLOQUE DE EJECUCIÓN ---
-if __name__ == "__main__":
+    # Utilizamos un bloque try...except para manejar cualquier error que pueda
+    # ocurrir durante la conexión o ejecución de la consulta.
     try:
-        if args.host: mcp.settings.host = args.host
-        if args.port: mcp.settings.port = int(args.port)
-        logger.info(f"Starting MCP Postgres server using {args.transport} transport on {mcp.settings.host}:{mcp.settings.port}")
-        if args.transport == "sse":
-            mcp.run(transport="sse", mount_path=args.mount)
-        else:
-            mcp.run(transport=args.transport)
+        # `psycopg.connect` usa la URL de la base de datos para conectarse.
+        # El bloque `with` asegura que la conexión se cierre correctamente.
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                # Ejecutamos la consulta SQL proporcionada.
+                cur.execute(input.sql)
+
+                # Si la consulta no devuelve filas (como un INSERT o UPDATE),
+                # `cur.description` será None.
+                if cur.description is None:
+                    status_message = cur.statusmessage or "Comando ejecutado con éxito."
+                    ctx.info(f"Consulta sin resultados (posiblemente INSERT/UPDATE). Estado: {status_message}")
+                    return {
+                        "status": "success",
+                        "message": status_message,
+                        "rows_affected": cur.rowcount
+                    }
+
+                # Obtenemos los nombres de las columnas para construir los diccionarios.
+                column_names = [desc[0] for desc in cur.description]
+                
+                # `fetchmany` recupera un número limitado de filas para evitar sobrecargar
+                # la memoria o el contexto del LLM.
+                rows = cur.fetchmany(input.row_limit)
+                
+                # Convertimos las filas (que son tuplas) en una lista de diccionarios.
+                # Esto es mucho más fácil de interpretar para un LLM que una lista de tuplas.
+                results = [dict(zip(column_names, row)) for row in rows]
+
+                ctx.info(f"Consulta exitosa. Devueltas {len(results)} filas.")
+                
+                return {
+                    "status": "success",
+                    "data": results
+                }
+
+    except psycopg.Error as e:
+        # Si ocurre un error de PostgreSQL (ej. sintaxis inválida),
+        # lo capturamos y lo devolvemos en un formato estructurado.
+        # Esto es lo que el agente usará para intentar corregir su propia consulta.
+        error_message = f"Error de base de datos: {e.diag.message_primary or str(e)}"
+        ctx.error(error_message)
+        return {
+            "status": "error",
+            "error": error_message
+        }
     except Exception as e:
-        logger.error(f"Server error: {str(e)}")
-        sys.exit(1)
+        # Capturamos cualquier otro error inesperado.
+        error_message = f"Error inesperado del servidor: {str(e)}"
+        ctx.error(error_message)
+        return {
+            "status": "error",
+            "error": error_message
+        }
+
+# --- PUNTO DE ENTRADA (PARA EJECUCIÓN DIRECTA) ---
+# Este bloque permite ejecutar el servidor directamente con `python postgres_server.py`.
+# El CLI de `fastmcp` (ej. `fastmcp dev`) también usa esto.
+if __name__ == "__main__":
+    mcp.run()

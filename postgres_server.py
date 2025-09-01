@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('fp-agent-mcp-server')
 
-# --- 2. MANEJO DE ARGUMENTOS Y VARIABLES DE ENTORNO (Sin cambios) ---
+# --- 2. MANEJO DE ARGUMENTOS Y VARIABLES DE ENTORNO (Línea corregida) ---
 parser = argparse.ArgumentParser(description="FP-Agent PostgreSQL MCP Server")
 parser.add_argument(
     "--conn",
@@ -25,9 +25,11 @@ parser.add_argument(
     default=os.getenv("DATABASE_URL"),
     help="PostgreSQL connection string (DSN)"
 )
+# --- ¡CORRECCIÓN AQUÍ! ---
+# Cambiamos el default a 'sse', que es el nombre correcto para FastMCP v1.x.
 parser.add_argument(
-    "--transport", dest="transport", default="streamable-http",
-    help="Transport protocol (default: streamable-http for web deployments)"
+    "--transport", dest="transport", default="sse",
+    help="Transport protocol (default: sse for web deployments)"
 )
 parser.add_argument(
     "--host", dest="host", default="0.0.0.0",
@@ -40,7 +42,9 @@ parser.add_argument(
 args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
-# --- 3. MODELO DE DATOS CON VALIDACIÓN DE SEGURIDAD (Sin cambios) ---
+# --- SECCIONES 3, 4 y 5 (Sin cambios) ---
+# El modelo Pydantic, la inicialización de MCP y la herramienta son correctos.
+
 class QueryInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
@@ -63,13 +67,11 @@ class QueryInput(BaseModel):
             raise ValueError(f"Operación SQL peligrosa '{sql_cleaned.split()[0]}' está estrictamente prohibida.")
         raise ValueError("Tipo de consulta SQL no permitida por las reglas de seguridad.")
 
-# --- 4. INICIALIZACIÓN DEL SERVIDOR MCP (Sin cambios) ---
 mcp = FastMCP(
     "FP-Agent PostgreSQL Server",
     log_level="INFO"
 )
 
-# --- 5. DEFINICIÓN DE LA ÚNICA HERRAMIENTA (Sin cambios) ---
 @mcp.tool()
 def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]:
     ctx.info(f"Ejecutando consulta validada. Límite de filas: {input.row_limit}")
@@ -97,10 +99,8 @@ def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]:
         ctx.error(error_message)
         return {"error": error_message}
 
-# --- 6. PUNTO DE ENTRADA PARA LA EJECUCIÓN (¡CORREGIDO!) ---
+# --- 6. PUNTO DE ENTRADA PARA LA EJECUCIÓN (Sin cambios respecto a la versión anterior) ---
 if __name__ == "__main__":
-    # Asignamos el host y el puerto a la configuración del servidor ANTES de ejecutarlo.
-    # Esta es la forma correcta que FastMCP espera.
     if args.host:
         mcp.settings.host = args.host
     if args.port:
@@ -111,5 +111,4 @@ if __name__ == "__main__":
         mcp.settings.host, mcp.settings.port, args.transport
     )
 
-    # Ahora llamamos a run() solo con los argumentos que realmente acepta.
     mcp.run(transport=args.transport)

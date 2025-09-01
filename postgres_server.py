@@ -10,13 +10,11 @@ import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator
 from fastmcp import FastMCP, Context
-# --- ¡NUEVAS IMPORTACIONES! ---
 from starlette.responses import JSONResponse
-from starlette.requests import Request
 
-# ... (toda la configuración de logging y argparse se mantiene igual) ...
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('fp-agent-mcp-server')
+
 parser = argparse.ArgumentParser(description="FP-Agent PostgreSQL MCP Server")
 parser.add_argument("--conn", dest="conn", default=os.getenv("DATABASE_URL"), help="PostgreSQL connection string")
 parser.add_argument("--transport", dest="transport", default="sse", help="Transport protocol")
@@ -26,10 +24,10 @@ args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
 class QueryInput(BaseModel):
-    # ... (el modelo Pydantic no cambia) ...
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = Field(default=100, ge=1)
+
     @field_validator('sql')
     def validate_allowed_operations(cls, value: str) -> str:
         sql_cleaned = value.strip().removesuffix(';').lower()
@@ -45,20 +43,10 @@ class QueryInput(BaseModel):
 mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
-async def run_query_json(input: QueryInput, request: Request) -> JSONResponse:
-    """
-    Ejecuta una consulta SQL y devuelve una respuesta JSON-RPC completa.
-    """
-    # Obtenemos el ID de la petición original para construir la respuesta.
-    # Necesitamos leer el cuerpo de la petición para obtener el JSON-RPC request.
-    try:
-        raw_body = await request.body()
-        rpc_request = json.loads(raw_body)
-        request_id = rpc_request.get("id")
-    except Exception:
-        request_id = None # Fallback
-
+def run_query_json(input: QueryInput, ctx: Context) -> JSONResponse:
+    request_id = ctx.request_id
     result_data = {}
+
     if not CONNECTION_STRING:
         result_data = {"error": {"code": -32000, "message": "Servidor no configurado para conectar a la base de datos."}}
     else:
@@ -78,19 +66,19 @@ async def run_query_json(input: QueryInput, request: Request) -> JSONResponse:
             error_message = f"Error de base de datos: {getattr(e, 'diag', {}).get('message_primary', str(e))}"
             result_data = {"error": {"code": -32001, "message": error_message}}
 
-    # Construimos la respuesta JSON-RPC completa que el cliente espera.
     final_response_obj = {
         "jsonrpc": "2.0",
         "id": request_id,
-        **result_data # Desempaqueta 'result' o 'error' aquí
+        **result_data
     }
     
-    # Devolvemos un objeto de respuesta HTTP válido que Starlette entiende.
     return JSONResponse(content=final_response_obj)
 
-# ... (el bloque if __name__ == "__main__" se mantiene igual) ...
 if __name__ == "__main__":
-    if args.host: mcp.settings.host = args.host
-    if args.port: mcp.settings.port = args.port
+    if args.host:
+        mcp.settings.host = args.host
+    if args.port:
+        mcp.settings.port = args.port
+        
     logger.info("Iniciando FP-Agent MCP Server en %s:%s usando transporte %s", mcp.settings.host, mcp.settings.port, args.transport)
     mcp.run(transport=args.transport)

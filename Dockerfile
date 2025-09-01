@@ -22,4 +22,4 @@ EXPOSE 8000
 
 # Define el comando por defecto para iniciar el servidor.
 # El "Start Command" de Railway puede sobreescribir esto.
-CMD ["python", "postgre_server.py", "--host", "0.0.0.0"]
+CMD ["python", "postgres_server.py", "--host", "0.0.0.0"]

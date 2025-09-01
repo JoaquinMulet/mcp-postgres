@@ -10,7 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator
 from fastmcp import FastMCP, Context
-from starlette.responses import JSONResponse
+from starlette.responses import Response # Usaremos la respuesta base para más control
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('fp-agent-mcp-server')
@@ -27,13 +27,12 @@ class QueryInput(BaseModel):
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = Field(default=100, ge=1)
-
     @field_validator('sql')
     def validate_allowed_operations(cls, value: str) -> str:
         sql_cleaned = value.strip().removesuffix(';').lower()
         if sql_cleaned.startswith(('select', 'with')): return value
         if sql_cleaned.startswith('insert into'): return value
-        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
+        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
         if update_pattern.match(value.strip()): return value
         if sql_cleaned.startswith('update'): raise ValueError("Operación UPDATE no permitida.")
         dangerous_keywords = ['delete', 'drop', 'create', 'alter', 'truncate']
@@ -43,7 +42,7 @@ class QueryInput(BaseModel):
 mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
-def run_query_json(input: QueryInput, ctx: Context) -> JSONResponse:
+def run_query_json(input: QueryInput, ctx: Context) -> Response:
     request_id = ctx.request_id
     result_data = {}
 
@@ -59,26 +58,25 @@ def run_query_json(input: QueryInput, ctx: Context) -> JSONResponse:
                         result_obj = {"status": "success", "message": cur.statusmessage or "Comando exitoso.", "rows_affected": cur.rowcount}
                         result_data = {"result": result_obj}
                     else:
-                        rows = cur.fetchmany(input.row_limit)
+                        rows = list(cur.fetchmany(input.row_limit))
                         success_obj = {"status": "success", "data": rows}
                         result_data = {"result": success_obj}
         except Exception as e:
             error_message = f"Error de base de datos: {getattr(e, 'diag', {}).get('message_primary', str(e))}"
             result_data = {"error": {"code": -32001, "message": error_message}}
 
-    final_response_obj = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        **result_data
-    }
+    final_response_obj = { "jsonrpc": "2.0", "id": request_id, **result_data }
     
-    return JSONResponse(content=final_response_obj)
+    # --- ¡SOLUCIÓN DEFINITIVA! ---
+    # Serializamos manualmente a un string JSON, usando `default=str` para manejar
+    # tipos de datos especiales como UUID, datetime, y Decimal.
+    json_body = json.dumps(final_response_obj, default=str)
+    
+    # Devolvemos una respuesta HTTP estándar con el cuerpo JSON y el media type correcto.
+    return Response(content=json_body, media_type="application/json")
 
 if __name__ == "__main__":
-    if args.host:
-        mcp.settings.host = args.host
-    if args.port:
-        mcp.settings.port = args.port
-        
+    if args.host: mcp.settings.host = args.host
+    if args.port: mcp.settings.port = args.port
     logger.info("Iniciando FP-Agent MCP Server en %s:%s usando transporte %s", mcp.settings.host, mcp.settings.port, args.transport)
     mcp.run(transport=args.transport)

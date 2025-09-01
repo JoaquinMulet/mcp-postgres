@@ -17,29 +17,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger('fp-agent-mcp-server')
 
-# --- 2. MANEJO DE ARGUMENTOS (Añadido --mount) ---
+# --- 2. MANEJO DE ARGUMENTOS (Simplificado) ---
 parser = argparse.ArgumentParser(description="FP-Agent PostgreSQL MCP Server")
-parser.add_argument(
-    "--conn", dest="conn", default=os.getenv("DATABASE_URL"),
-    help="PostgreSQL connection string (DSN)"
-)
-parser.add_argument(
-    "--transport", dest="transport", default="sse",
-    help="Transport protocol (default: sse for web deployments)"
-)
-parser.add_argument(
-    "--host", dest="host", default="0.0.0.0",
-    help="Host to bind for HTTP transport (default: 0.0.0.0 for containers)"
-)
-parser.add_argument(
-    "--port", dest="port", type=int, default=8000,
-    help="Port to bind for HTTP transport (default: 8000)"
-)
-# --- ¡NUEVO ARGUMENTO AQUÍ! ---
-parser.add_argument(
-    "--mount", dest="mount", default="/mcp",
-    help="Mount path for SSE transport (e.g., /mcp)"
-)
+parser.add_argument("--conn", dest="conn", default=os.getenv("DATABASE_URL"), help="PostgreSQL connection string")
+parser.add_argument("--transport", dest="transport", default="sse", help="Transport protocol")
+parser.add_argument("--host", dest="host", default="0.0.0.0", help="Host to bind")
+parser.add_argument("--port", dest="port", type=int, default=8000, help="Port to bind")
+# Se ha eliminado el argumento --mount
 args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
@@ -50,6 +34,7 @@ class QueryInput(BaseModel):
     row_limit: int = Field(default=100, ge=1)
     @field_validator('sql')
     def validate_allowed_operations(cls, value: str) -> str:
+        # La lógica de validación se mantiene igual
         sql_cleaned = value.strip().removesuffix(';').lower()
         if sql_cleaned.startswith(('select', 'with')): return value
         if sql_cleaned.startswith('insert into'): return value
@@ -64,7 +49,7 @@ mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
 def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]:
-    # (La lógica de la herramienta no cambia)
+    # La lógica de la herramienta se mantiene igual
     ctx.info(f"Ejecutando consulta validada. Límite: {input.row_limit}")
     if not CONNECTION_STRING:
         return {"error": "Servidor no configurado para conectar a la base de datos."}
@@ -82,17 +67,14 @@ def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]:
         ctx.error(error_message)
         return {"error": error_message}
 
-
-# --- 6. PUNTO DE ENTRADA (Llamada a run() actualizada) ---
+# --- 6. PUNTO DE ENTRADA (Simplificado) ---
 if __name__ == "__main__":
     if args.host: mcp.settings.host = args.host
     if args.port: mcp.settings.port = args.port
 
     logger.info(
-        "Iniciando FP-Agent MCP Server en %s:%s, montado en '%s' usando transporte %s",
-        mcp.settings.host, mcp.settings.port, args.mount, args.transport
+        "Iniciando FP-Agent MCP Server en %s:%s usando transporte %s",
+        mcp.settings.host, mcp.settings.port, args.transport
     )
-
-    # --- ¡CORRECCIÓN FINAL AQUÍ! ---
-    # Pasamos el mount_path a la función run().
-    mcp.run(transport=args.transport, mount_path=args.mount)
+    # Volvemos a la llamada simple que sí funciona
+    mcp.run(transport=args.transport)

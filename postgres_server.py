@@ -3,13 +3,16 @@ import sys
 import logging
 import argparse
 import re
-import json # <--- ¡NUEVA IMPORTACIÓN!
+import json
 from typing import Any, Optional, List, Dict
 
 import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator
 from fastmcp import FastMCP, Context
+# --- ¡NUEVAS IMPORTACIONES! ---
+from starlette.responses import JSONResponse
+from starlette.requests import Request
 
 # ... (toda la configuración de logging y argparse se mantiene igual) ...
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -23,6 +26,7 @@ args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
 class QueryInput(BaseModel):
+    # ... (el modelo Pydantic no cambia) ...
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = Field(default=100, ge=1)
@@ -41,38 +45,127 @@ class QueryInput(BaseModel):
 mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
-def run_query_json(input: QueryInput, ctx: Context) -> str: # <--- CAMBIO: El tipo de retorno ahora es str
+async def run_query_json(input: QueryInput, request: Request) -> JSONResponse:
     """
-    Ejecuta una consulta SQL segura y devuelve los resultados como un string JSON.
+    Ejecuta una consulta SQL y devuelve una respuesta JSON-RPC completa.
     """
-    ctx.info(f"Ejecutando consulta validada. Límite: {input.row_limit}")
-    if not CONNECTION_STRING:
-        error_obj = {"error": "Servidor no configurado para conectar a la base de datos."}
-        return json.dumps(error_obj) # <--- CAMBIO: Devuelve string JSON
-
+    # Obtenemos el ID de la petición original para construir la respuesta.
+    # Necesitamos leer el cuerpo de la petición para obtener el JSON-RPC request.
     try:
-        with psycopg.connect(CONNECTION_STRING) as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(input.sql, input.parameters)
-                if cur.description is None:
-                    conn.commit()
-                    result_obj = {"status": "success", "message": cur.statusmessage or "Comando exitoso.", "rows_affected": cur.rowcount}
-                    return json.dumps(result_obj) # <--- CAMBIO: Devuelve string JSON
-                
-                rows = cur.fetchmany(input.row_limit)
-                success_obj = {"status": "success", "data": rows}
-                # default=str maneja tipos de datos de DB como fechas o decimales.
-                return json.dumps(success_obj, default=str) # <--- CAMBIO: Devuelve string JSON
+        raw_body = await request.body()
+        rpc_request = json.loads(raw_body)
+        request_id = rpc_request.get("id")
+    except Exception:
+        request_id = None # Fallback
 
-    except Exception as e:
-        error_message = f"Error de base de datos: {getattr(e, 'diag', {}).get('message_primary', str(e))}"
-        ctx.error(error_message)
-        error_obj = {"error": error_message}
-        return json.dumps(error_obj) # <--- CAMBIO: Devuelve string JSON
+    result_data = {}
+    if not CONNECTION_STRING:
+        result_data = {"error": {"code": -32000, "message": "Servidor no configurado para conectar a la base de datos."}}
+    else:
+        try:
+            with psycopg.connect(CONNECTION_STRING) as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(input.sql, input.parameters)
+                    if cur.description is None:
+                        conn.commit()
+                        result_obj = {"status": "success", "message": cur.statusmessage or "Comando exitoso.", "rows_affected": cur.rowcount}
+                        result_data = {"result": result_obj}
+                    else:
+                        rows = cur.fetchmany(input.row_limit)
+                        success_obj = {"status": "success", "data": rows}
+                        result_data = {"result": success_obj}
+        except Exception as e:
+            error_message = f"Error de base de datos: {getattr(e, 'diag', {}).get('message_primary', str(e))}"
+            result_data = {"error": {"code": -32001, "message": error_message}}
+
+    # Construimos la respuesta JSON-RPC completa que el cliente espera.
+    final_response_obj = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        **result_data # Desempaqueta 'result' o 'error' aquí
+    }
+    
+    # Devolvemos un objeto de respuesta HTTP válido que Starlette entiende.
+    return JSONResponse(content=final_response_obj)
 
 # ... (el bloque if __name__ == "__main__" se mantiene igual) ...
 if __name__ == "__main__":
     if args.host: mcp.settings.host = args.host
     if args.port: mcp.settings.port = args.port
     logger.info("Iniciando FP-Agent MCP Server en %s:%s usando transporte %s", mcp.settings.host, mcp.settings.port, args.transport)
-    mcp.run(transport=args.transport)
+    mcp.run(transport=args.transport)```
+
+---
+
+### 2. `mcp.service.ts` (Versión Final Simplificada)
+
+Ahora que el servidor devuelve el objeto JSON-RPC completo, la librería `mcp-client` lo manejará a la perfección. Podemos simplificar nuestro `mcp.service.ts` para que sea más limpio y confíe en la librería.
+
+```typescript
+import { MCPClient } from 'mcp-client';
+import { env } from '../config/environment';
+
+export interface SessionState { /* ... */ }
+
+const client = new MCPClient({
+  name: "fp-agent-whatsapp-bot",
+  version: "1.0.0",
+});
+
+let connectionPromise: Promise<void> | null = null;
+
+async function ensureConnection() {
+    if (!client.isConnected) {
+        connectionPromise = null;
+    }
+    if (!connectionPromise) {
+        console.log('🤝 Conectando al servidor MCP usando mcp-client...');
+        const serverUrl = env.mcpServerUrl.replace(/\/$/, '');
+        connectionPromise = client.connect({
+            type: 'sse',
+            url: `${serverUrl}/sse`
+        });
+        await connectionPromise;
+        console.log('✅ Conexión con el servidor MCP establecida con éxito.');
+    }
+    return connectionPromise;
+}
+
+class MCPService {
+    public async executeTool(toolName: string, toolArgs: any): Promise<any> {
+        try {
+            await ensureConnection();
+            console.log(`➡️  Enviando la herramienta '${toolName}' usando mcp-client...`);
+            
+            const result = await client.callTool({
+                name: toolName,
+                arguments: toolArgs,
+            });
+            
+            console.log('⬅️  Respuesta de la herramienta recibida con éxito.');
+            
+            // "Desempaquetamos" el resultado para dárselo limpio al flujo principal.
+            const content = result.structuredContent as any;
+            
+            if (content && content.status === 'success' && content.data !== undefined) {
+                return content.data; // Devolvemos solo el array de datos
+            } else if (content && content.error) {
+                return { error: content.error };
+            }
+
+            return content; // Fallback
+
+        } catch (error) {
+            console.error('❌ Fallo durante la ejecución de la herramienta con mcp-client:', error);
+            connectionPromise = null; 
+            const errorMessage = error instanceof Error ? error.message : 'Error desconocido.';
+            return { error: errorMessage };
+        }
+    }
+}
+
+const mcpService = new MCPService();
+
+export const executeSql = (payload: any, state: SessionState) => {
+    return mcpService.executeTool('run_query_json', payload);
+};

@@ -10,11 +10,12 @@ import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator
 from fastmcp import FastMCP, Context
-from starlette.responses import JSONResponse
+# Usaremos Response, que es más genérica y no tiene el problema.
+from starlette.responses import Response 
 
-# ... (toda la configuración de logging y argparse se mantiene igual) ...
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('fp-agent-mcp-server')
+
 parser = argparse.ArgumentParser(description="FP-Agent PostgreSQL MCP Server")
 parser.add_argument("--conn", dest="conn", default=os.getenv("DATABASE_URL"), help="PostgreSQL connection string")
 parser.add_argument("--transport", dest="transport", default="sse", help="Transport protocol")
@@ -24,7 +25,6 @@ args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
 class QueryInput(BaseModel):
-    # ... (el modelo Pydantic no cambia) ...
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = Field(default=100, ge=1)
@@ -43,7 +43,7 @@ class QueryInput(BaseModel):
 mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
-def run_query_json(input: QueryInput, ctx: Context) -> JSONResponse:
+def run_query_json(input: QueryInput, ctx: Context) -> Response:
     request_id = ctx.request_id
     result_data = {}
 
@@ -63,16 +63,20 @@ def run_query_json(input: QueryInput, ctx: Context) -> JSONResponse:
                         success_obj = {"status": "success", "data": rows}
                         result_data = {"result": success_obj}
         except Exception as e:
-            # --- ¡SOLUCIÓN AL BUG! ---
-            # Convertimos la excepción directamente a string. Esto es más seguro y nos da
-            # el mensaje de error real de la base de datos (ej. "column 'x' does not exist").
+            # Manejo de errores robusto que convierte la excepción a string.
             error_message = f"Error de base de datos: {str(e)}"
             result_data = {"error": {"code": -32001, "message": error_message}}
 
     final_response_obj = { "jsonrpc": "2.0", "id": request_id, **result_data }
-    return JSONResponse(content=final_response_obj, default=str) # Añadimos default=str por si acaso
+    
+    # --- ¡SOLUCIÓN CORRECTA! ---
+    # 1. Creamos el string JSON usando json.dumps, que SÍ acepta `default=str`.
+    json_content = json.dumps(final_response_obj, default=str)
+    
+    # 2. Devolvemos una respuesta HTTP genérica con el contenido y el tipo de medio correctos.
+    return Response(content=json_content, media_type="application/json")
 
-# ... (el bloque if __name__ == "__main__" se mantiene igual) ...
+
 if __name__ == "__main__":
     if args.host: mcp.settings.host = args.host
     if args.port: mcp.settings.port = args.port

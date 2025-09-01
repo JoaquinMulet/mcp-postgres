@@ -10,7 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator
 from fastmcp import FastMCP, Context
-from starlette.responses import Response # Usaremos la respuesta base para más control
+# Ya no necesitamos JSONResponse ni Request de Starlette
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('fp-agent-mcp-server')
@@ -42,7 +42,10 @@ class QueryInput(BaseModel):
 mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
-def run_query_json(input: QueryInput, ctx: Context) -> Response:
+def run_query_json(input: QueryInput, ctx: Context) -> str: # <-- El tipo de retorno es 'str'
+    """
+    Ejecuta una consulta SQL y devuelve los resultados como un string JSON.
+    """
     request_id = ctx.request_id
     result_data = {}
 
@@ -67,13 +70,11 @@ def run_query_json(input: QueryInput, ctx: Context) -> Response:
 
     final_response_obj = { "jsonrpc": "2.0", "id": request_id, **result_data }
     
-    # --- ¡SOLUCIÓN DEFINITIVA! ---
+    # --- ¡LA SOLUCIÓN A TODO! ---
     # Serializamos manualmente a un string JSON, usando `default=str` para manejar
     # tipos de datos especiales como UUID, datetime, y Decimal.
-    json_body = json.dumps(final_response_obj, default=str)
-    
-    # Devolvemos una respuesta HTTP estándar con el cuerpo JSON y el media type correcto.
-    return Response(content=json_body, media_type="application/json")
+    # Esto resuelve tanto el error de serialización del UUID como el bug de FastMCP.
+    return json.dumps(final_response_obj, default=str)
 
 if __name__ == "__main__":
     if args.host: mcp.settings.host = args.host

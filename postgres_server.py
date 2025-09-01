@@ -10,11 +10,11 @@ import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field, field_validator
 from fastmcp import FastMCP, Context
-# Ya no necesitamos JSONResponse ni Request de Starlette
+from starlette.responses import JSONResponse
 
+# ... (toda la configuración de logging y argparse se mantiene igual) ...
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('fp-agent-mcp-server')
-
 parser = argparse.ArgumentParser(description="FP-Agent PostgreSQL MCP Server")
 parser.add_argument("--conn", dest="conn", default=os.getenv("DATABASE_URL"), help="PostgreSQL connection string")
 parser.add_argument("--transport", dest="transport", default="sse", help="Transport protocol")
@@ -24,6 +24,7 @@ args, _ = parser.parse_known_args()
 CONNECTION_STRING: Optional[str] = args.conn
 
 class QueryInput(BaseModel):
+    # ... (el modelo Pydantic no cambia) ...
     sql: str
     parameters: Optional[List[Any]] = None
     row_limit: int = Field(default=100, ge=1)
@@ -42,10 +43,7 @@ class QueryInput(BaseModel):
 mcp = FastMCP("FP-Agent PostgreSQL Server", log_level="INFO")
 
 @mcp.tool()
-def run_query_json(input: QueryInput, ctx: Context) -> str: # <-- El tipo de retorno es 'str'
-    """
-    Ejecuta una consulta SQL y devuelve los resultados como un string JSON.
-    """
+def run_query_json(input: QueryInput, ctx: Context) -> JSONResponse:
     request_id = ctx.request_id
     result_data = {}
 
@@ -65,17 +63,16 @@ def run_query_json(input: QueryInput, ctx: Context) -> str: # <-- El tipo de ret
                         success_obj = {"status": "success", "data": rows}
                         result_data = {"result": success_obj}
         except Exception as e:
-            error_message = f"Error de base de datos: {getattr(e, 'diag', {}).get('message_primary', str(e))}"
+            # --- ¡SOLUCIÓN AL BUG! ---
+            # Convertimos la excepción directamente a string. Esto es más seguro y nos da
+            # el mensaje de error real de la base de datos (ej. "column 'x' does not exist").
+            error_message = f"Error de base de datos: {str(e)}"
             result_data = {"error": {"code": -32001, "message": error_message}}
 
     final_response_obj = { "jsonrpc": "2.0", "id": request_id, **result_data }
-    
-    # --- ¡LA SOLUCIÓN A TODO! ---
-    # Serializamos manualmente a un string JSON, usando `default=str` para manejar
-    # tipos de datos especiales como UUID, datetime, y Decimal.
-    # Esto resuelve tanto el error de serialización del UUID como el bug de FastMCP.
-    return json.dumps(final_response_obj, default=str)
+    return JSONResponse(content=final_response_obj, default=str) # Añadimos default=str por si acaso
 
+# ... (el bloque if __name__ == "__main__" se mantiene igual) ...
 if __name__ == "__main__":
     if args.host: mcp.settings.host = args.host
     if args.port: mcp.settings.port = args.port

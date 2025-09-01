@@ -76,7 +76,7 @@ def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]: # <-- El 
     # 3. Devolvemos este objeto limpio. FastMCP ahora podrá serializarlo sin problemas.
     return clean_python_object
 
-    @mcp.tool()
+@mcp.tool()
 def get_system_context(ctx: Context) -> Dict[str, Any]:
     """
     Recupera toda la información contextual clave (cuentas, categorías, comercios, tags)

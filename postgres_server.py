@@ -33,7 +33,7 @@ class QueryInput(BaseModel):
         sql_cleaned = value.strip().removesuffix(';').lower()
         if sql_cleaned.startswith(('select', 'with')): return value
         if sql_cleaned.startswith('insert into'): return value
-        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
+        update_pattern = re.compile(r"^\s*update\s+transactions\s+set\s+status\s*=\s*'(void|superseded)'.*$", re.IGNORECASE)
         if update_pattern.match(value.strip()): return value
         if sql_cleaned.startswith('update'): raise ValueError("Operación UPDATE no permitida.")
         dangerous_keywords = ['delete', 'drop', 'create', 'alter', 'truncate']

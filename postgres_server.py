@@ -76,6 +76,41 @@ def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]: # <-- El 
     # 3. Devolvemos este objeto limpio. FastMCP ahora podrá serializarlo sin problemas.
     return clean_python_object
 
+    @mcp.tool()
+def get_system_context(ctx: Context) -> Dict[str, Any]:
+    """
+    Recupera toda la información contextual clave (cuentas, categorías, comercios, tags)
+    en una sola llamada para inyectarla en el system prompt del agente.
+    """
+    if not CONNECTION_STRING:
+        return {"error": "Servidor no configurado para conectar a la base de datos."}
+
+    context_data = {}
+    try:
+        with psycopg.connect(CONNECTION_STRING) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Obtenemos las cuentas
+                cur.execute("SELECT account_id, account_name, account_type, currency_code FROM accounts ORDER BY account_name;")
+                context_data['accounts'] = list(cur.fetchall())
+                
+                # Obtenemos las categorías
+                cur.execute("SELECT category_id, category_name FROM categories ORDER BY category_name;")
+                context_data['categories'] = list(cur.fetchall())
+
+                # Obtenemos los comercios
+                cur.execute("SELECT merchant_id, merchant_name FROM merchants ORDER BY merchant_name;")
+                context_data['merchants'] = list(cur.fetchall())
+
+                # Obtenemos los tags
+                cur.execute("SELECT tag_id, tag_name FROM tags ORDER BY tag_name;")
+                context_data['tags'] = list(cur.fetchall())
+    except Exception as e:
+        return {"error": f"Error de base de datos al obtener contexto: {str(e)}"}
+
+    # Usamos la misma técnica de "limpieza" para asegurar que todo sea serializable
+    json_string = json.dumps(context_data, default=str)
+    return json.loads(json_string)
+
 if __name__ == "__main__":
     if args.host: mcp.settings.host = args.host
     if args.port: mcp.settings.port = args.port

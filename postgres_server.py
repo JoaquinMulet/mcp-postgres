@@ -79,7 +79,7 @@ def run_query_json(input: QueryInput, ctx: Context) -> Dict[str, Any]: # <-- El 
 @mcp.tool()
 def get_system_context(ctx: Context) -> Dict[str, Any]:
     """
-    Recupera toda la información contextual clave (cuentas, categorías, comercios, tags)
+    Recupera toda la información contextual clave (cuentas, categorías, comercios, tags y memorias)
     en una sola llamada para inyectarla en el system prompt del agente.
     """
     if not CONNECTION_STRING:
@@ -104,6 +104,13 @@ def get_system_context(ctx: Context) -> Dict[str, Any]:
                 # Obtenemos los tags
                 cur.execute("SELECT tag_id, tag_name FROM tags ORDER BY tag_name;")
                 context_data['tags'] = list(cur.fetchall())
+                
+                # --- SECCIÓN MODIFICADA ---
+                # Obtenemos TODOS los datos de la tabla de memoria.
+                cur.execute("SELECT * FROM agent_memory;")
+                context_data['agent_memories'] = list(cur.fetchall())
+                # --- FIN DE LA SECCIÓN MODIFICADA ---
+
     except Exception as e:
         return {"error": f"Error de base de datos al obtener contexto: {str(e)}"}
 
